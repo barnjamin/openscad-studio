@@ -5,7 +5,11 @@ mod types;
 
 use cmd::{update_editor_state, update_working_dir, EditorState, OpenScadBinaryState};
 use history::HistoryState;
-use mcp::{remove_window, update_window_focus, McpServerState, WindowLaunchIntent};
+use mcp::{
+    record_window_startup_phase, remove_window, update_window_focus, McpServerState,
+    WindowLaunchIntent,
+};
+use tauri::webview::PageLoadEvent;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use uuid::Uuid;
@@ -15,11 +19,21 @@ pub(crate) fn create_new_window_with_launch_intent(
     intent: WindowLaunchIntent,
 ) -> tauri::Result<String> {
     let label = format!("window-{}", Uuid::new_v4());
-    eprintln!(
-        "[startup:{}] create_new_window_with_launch_intent {:?}",
-        label, intent
-    );
-    build_window_with_label(app, &label, &intent)?;
+
+    // Window creation MUST happen on the main thread so that the IPC response
+    // handler is properly registered for the new webview. When called from a
+    // background thread (e.g. the MCP HTTP server), dispatching via
+    // run_on_main_thread ensures the window is created correctly.
+    let app_clone = app.clone();
+    let label_clone = label.clone();
+    let (tx, rx) = std::sync::mpsc::channel();
+    app.run_on_main_thread(move || {
+        let result = build_window_with_label(&app_clone, &label_clone, &intent);
+        let _ = tx.send(result);
+    })?;
+
+    rx.recv()
+        .map_err(|e| tauri::Error::Anyhow(e.into()))??;
     Ok(label)
 }
 
@@ -31,11 +45,27 @@ fn build_window_with_label(
     let launch_intent = serde_json::to_string(intent).expect("serializable window launch intent");
     let initialization_script =
         format!("window.__OPENSCAD_STUDIO_BOOTSTRAP__ = {{ launchIntent: {launch_intent} }};");
+    let mcp_state = app.state::<McpServerState>().inner().clone();
+    record_window_startup_phase(&mcp_state, label, "window_created", None);
 
     WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
         .title("OpenSCAD Studio")
         .inner_size(1400.0, 900.0)
         .initialization_script(&initialization_script)
+        .on_page_load(move |window, payload| {
+            let phase = match payload.event() {
+                PageLoadEvent::Started => "page_load_started",
+                PageLoadEvent::Finished => "page_load_finished",
+            };
+            let detail = Some(payload.url().to_string());
+            eprintln!(
+                "[startup:{}] page_load phase={} url={}",
+                window.label(),
+                phase,
+                payload.url()
+            );
+            record_window_startup_phase(&mcp_state, window.label(), phase, detail);
+        })
         .build()?;
     Ok(())
 }
@@ -95,6 +125,7 @@ pub fn run() {
             mcp::get_mcp_server_status,
             mcp::mcp_submit_tool_response,
             mcp::mcp_mark_window_bridge_ready,
+            mcp::mcp_report_window_startup_phase,
             mcp::report_window_open_result,
             mcp::mcp_update_window_context,
         ])

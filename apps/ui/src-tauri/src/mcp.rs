@@ -92,6 +92,10 @@ pub enum WindowLaunchIntent {
         request_id: String,
         folder_path: String,
         create_if_empty: bool,
+        /// Pre-read .scad file contents (relative path → content).
+        /// Avoids FS plugin IPC calls from secondary windows.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        files: Option<std::collections::HashMap<String, String>>,
     },
     OpenFile {
         request_id: String,
@@ -132,12 +136,21 @@ pub struct WindowContextPayload {
     pub ready: bool,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowStartupPhasePayload {
+    pub phase: String,
+    pub detail: Option<String>,
+}
+
 #[derive(Clone, Debug)]
 struct RegisteredWorkspace {
     descriptor: WorkspaceDescriptor,
     show_welcome: bool,
     mode: RegisteredWindowMode,
     pending_request_id: Option<String>,
+    startup_phase: String,
+    startup_detail: Option<String>,
     context_ready: bool,
     bridge_ready: bool,
     last_focused_order: u64,
@@ -207,6 +220,74 @@ impl Default for McpServerState {
             })),
         }
     }
+}
+
+/// Read all `.scad` files from a directory tree, returning relative path → content.
+fn read_scad_files(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
+    use std::collections::HashMap;
+    let mut files = HashMap::new();
+
+    fn walk(
+        base: &std::path::Path,
+        current: &std::path::Path,
+        files: &mut HashMap<String, String>,
+    ) {
+        let Ok(entries) = std::fs::read_dir(current) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name_str = name.to_string_lossy();
+            if name_str.starts_with('.') {
+                continue;
+            }
+            if path.is_dir() {
+                walk(base, &path, files);
+            } else if name_str.ends_with(".scad") {
+                if let Ok(content) = std::fs::read_to_string(&path) {
+                    if let Ok(rel) = path.strip_prefix(base) {
+                        files.insert(rel.to_string_lossy().into_owned(), content);
+                    }
+                }
+            }
+        }
+    }
+
+    walk(dir, dir, &mut files);
+    files
+}
+
+pub(crate) fn record_window_startup_phase(
+    state: &McpServerState,
+    window_label: &str,
+    phase: impl Into<String>,
+    detail: Option<String>,
+) {
+    let phase = phase.into();
+    let mut inner = state.inner.lock().unwrap();
+    let workspace = inner
+        .workspaces
+        .entry(window_label.to_string())
+        .or_insert_with(|| RegisteredWorkspace {
+            descriptor: WorkspaceDescriptor {
+                window_id: window_label.to_string(),
+                title: "OpenSCAD Studio".into(),
+                workspace_root: None,
+                render_target_path: None,
+                is_focused: false,
+            },
+            show_welcome: true,
+            mode: RegisteredWindowMode::Welcome,
+            pending_request_id: None,
+            startup_phase: "created".into(),
+            startup_detail: None,
+            context_ready: false,
+            bridge_ready: false,
+            last_focused_order: 0,
+        });
+    workspace.startup_phase = phase;
+    workspace.startup_detail = detail;
 }
 
 struct RpcOutcome {
@@ -354,6 +435,15 @@ fn choose_blank_welcome_window(inner: &McpStateInner) -> Option<String> {
         .map(|(window_id, _)| window_id.clone())
 }
 
+fn describe_workspace_startup_phase(workspace: &RegisteredWorkspace) -> String {
+    match &workspace.startup_detail {
+        Some(detail) if !detail.trim().is_empty() => {
+            format!("last startup phase: {} ({detail})", workspace.startup_phase)
+        }
+        _ => format!("last startup phase: {}", workspace.startup_phase),
+    }
+}
+
 fn bind_session_to_window(inner: &mut McpStateInner, session_id: &str, window_id: String) {
     inner
         .sessions
@@ -382,8 +472,15 @@ fn wait_for_window_tool_ready(
         }
 
         if Instant::now() >= deadline {
+            let phase = inner
+                .lock()
+                .unwrap()
+                .workspaces
+                .get(window_id)
+                .map(describe_workspace_startup_phase)
+                .unwrap_or_else(|| "last startup phase: unknown".into());
             return Err(format!(
-                "Timed out waiting for OpenSCAD Studio window `{window_id}` to finish starting its MCP bridge."
+                "Timed out waiting for OpenSCAD Studio window `{window_id}` to finish starting its MCP bridge ({phase})."
             ));
         }
 
@@ -532,13 +629,17 @@ fn wait_for_window_open_result(
     match rx.recv_timeout(timeout) {
         Ok(result) => result,
         Err(mpsc::RecvTimeoutError::Timeout) => {
-            inner
-                .lock()
-                .unwrap()
-                .window_open_requests
-                .remove(request_id);
+            let phase = {
+                let mut locked = inner.lock().unwrap();
+                locked.window_open_requests.remove(request_id);
+                locked
+                    .workspaces
+                    .get(window_id)
+                    .map(describe_workspace_startup_phase)
+                    .unwrap_or_else(|| "last startup phase: unknown".into())
+            };
             Err(format!(
-                "Timed out waiting for OpenSCAD Studio to open `{target_description}` in window `{window_id}`."
+                "Timed out waiting for OpenSCAD Studio to open `{target_description}` in window `{window_id}` ({phase})."
             ))
         }
         Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -825,71 +926,28 @@ fn get_or_create_workspace_response(
             Err(message) => return text_tool_response(message, true),
         }
     } else {
+        // Create a new window with the open-folder intent baked into the
+        // initialization script. The window consumes the intent during its
+        // own bootstrap and reports back via report_window_open_result.
         let (request_id, rx) = create_window_open_request(inner, "pending-new-window");
-        eprintln!(
-            "[mcp] get_or_create_workspace creating new window for root={} request_id={}",
-            normalized_root, request_id
-        );
-        match create_new_window_with_launch_intent(
+        // Pre-read .scad files so the secondary window doesn't need FS plugin IPC.
+        let pre_read = read_scad_files(std::path::Path::new(&normalized_root));
+        let files = if pre_read.is_empty() { None } else { Some(pre_read) };
+        let window_id = match create_new_window_with_launch_intent(
             app,
             WindowLaunchIntent::OpenFolder {
                 request_id: request_id.clone(),
                 folder_path: normalized_root.clone(),
                 create_if_empty: true,
+                files,
             },
         ) {
-            Ok(window_id) => {
-                eprintln!(
-                    "[mcp] get_or_create_workspace created new window={} request_id={}",
-                    window_id, request_id
-                );
-                {
-                    let mut locked = inner.lock().unwrap();
-                    if let Some(pending) = locked.window_open_requests.get_mut(&request_id) {
-                        pending.window_id = window_id.clone();
-                    }
+            Ok(id) => {
+                let mut locked = inner.lock().unwrap();
+                if let Some(pending) = locked.window_open_requests.get_mut(&request_id) {
+                    pending.window_id = id.clone();
                 }
-                let result = match wait_for_window_open_result(
-                    inner,
-                    &request_id,
-                    rx,
-                    &window_id,
-                    &normalized_root,
-                    Duration::from_secs(120),
-                ) {
-                    Ok(result) => result,
-                    Err(message) => return text_tool_response(message, true),
-                };
-                let opened_root = result
-                    .opened_workspace_root
-                    .as_deref()
-                    .and_then(normalize_workspace_root);
-                if opened_root.as_deref() != Some(normalized_root.as_str()) {
-                    return text_tool_response(
-                        format!(
-                            "OpenSCAD Studio opened the wrong workspace in window `{window_id}`. Expected `{normalized_root}`, got `{}`.",
-                            opened_root.unwrap_or_else(|| "(unknown workspace)".into())
-                        ),
-                        true,
-                    );
-                }
-                let detail = {
-                    let locked = inner.lock().unwrap();
-                    if let Some(workspace) = locked.workspaces.get(&window_id) {
-                        let render_target = workspace
-                            .descriptor
-                            .render_target_path
-                            .clone()
-                            .unwrap_or_else(|| "(no render target)".into());
-                        format!(
-                            "✅ Opened workspace at {}.\n\nRender target: {}",
-                            normalized_root, render_target
-                        )
-                    } else {
-                        result.message
-                    }
-                };
-                (window_id, detail)
+                id
             }
             Err(error) => {
                 inner
@@ -902,7 +960,33 @@ fn get_or_create_workspace_response(
                     true,
                 );
             }
+        };
+
+        let result = match wait_for_window_open_result(
+            inner,
+            &request_id,
+            rx,
+            &window_id,
+            &normalized_root,
+            Duration::from_secs(120),
+        ) {
+            Ok(result) => result,
+            Err(message) => return text_tool_response(message, true),
+        };
+        let opened_root = result
+            .opened_workspace_root
+            .as_deref()
+            .and_then(normalize_workspace_root);
+        if opened_root.as_deref() != Some(normalized_root.as_str()) {
+            return text_tool_response(
+                format!(
+                    "OpenSCAD Studio opened the wrong workspace in window `{window_id}`. Expected `{normalized_root}`, got `{}`.",
+                    opened_root.unwrap_or_else(|| "(unknown workspace)".into())
+                ),
+                true,
+            );
         }
+        (window_id, result.message)
     };
 
     let mut locked = inner.lock().unwrap();
@@ -914,6 +998,58 @@ fn get_or_create_workspace_response(
         ),
         false,
     )
+}
+
+fn get_project_context_response(
+    inner: &Arc<Mutex<McpStateInner>>,
+    session_id: Option<&str>,
+) -> McpToolResponse {
+    let Some(session_id) = session_id else {
+        return text_tool_response(
+            "No OpenSCAD Studio workspace is selected for this MCP session. Call `get_or_create_workspace(folder_path)` first.",
+            true,
+        );
+    };
+
+    let mut locked = inner.lock().unwrap();
+    let window_id = match require_bound_window_id(&mut locked, session_id) {
+        Ok(window_id) => window_id,
+        Err(response) => return response,
+    };
+
+    let Some(workspace) = locked.workspaces.get(&window_id) else {
+        return text_tool_response(
+            format!(
+                "The previously selected Studio window `{window_id}` is no longer available. Call `get_or_create_workspace(folder_path)` again."
+            ),
+            true,
+        );
+    };
+
+    let mut parts = vec![format!("Studio window: {}", workspace.descriptor.title)];
+
+    if let Some(workspace_root) = &workspace.descriptor.workspace_root {
+        parts.push(format!("Workspace root: {workspace_root}"));
+    } else {
+        parts.push("Workspace root: (none)".into());
+    }
+
+    if let Some(render_target_path) = &workspace.descriptor.render_target_path {
+        parts.push(format!("Render target: {render_target_path}"));
+    } else {
+        parts.push("Render target: (none)".into());
+    }
+
+    let mode = match workspace.mode {
+        RegisteredWindowMode::Welcome => "welcome",
+        RegisteredWindowMode::Opening => "opening",
+        RegisteredWindowMode::Ready => "ready",
+        RegisteredWindowMode::OpenFailed => "open_failed",
+    };
+    parts.push(format!("Window mode: {mode}"));
+    parts.push(describe_workspace_startup_phase(workspace));
+
+    text_tool_response(parts.join("\n"), false)
 }
 
 fn handle_tool_call(
@@ -945,47 +1081,7 @@ fn handle_tool_call(
                 true,
             ),
         },
-        "get_project_context" => {
-            let window_id = {
-                let Some(session_id) = session_id.as_deref() else {
-                    return Ok(RpcOutcome {
-                        response: Some(jsonrpc_result(
-                            id,
-                            serde_json::to_value(text_tool_response(
-                                "No OpenSCAD Studio workspace is selected for this MCP session. Call `get_or_create_workspace(folder_path)` first.",
-                                true,
-                            ))
-                            .expect("serializable MCP tool response"),
-                        )),
-                        session_id: session_id_for_response.clone(),
-                    });
-                };
-
-                let mut inner = inner.lock().unwrap();
-                match require_bound_window_id(&mut inner, session_id) {
-                    Ok(window_id) => window_id,
-                    Err(response) => {
-                        return Ok(RpcOutcome {
-                            response: Some(jsonrpc_result(
-                                id,
-                                serde_json::to_value(response)
-                                    .expect("serializable MCP tool response"),
-                            )),
-                            session_id: session_id_for_response.clone(),
-                        })
-                    }
-                }
-            };
-
-            call_frontend_tool(
-                app,
-                inner,
-                &window_id,
-                name,
-                arguments,
-            )
-            .unwrap_or_else(|message| text_tool_response(message, true))
-        }
+        "get_project_context" => get_project_context_response(inner, session_id.as_deref()),
         _ => {
             let window_id = {
                 let Some(session_id) = session_id.as_deref() else {
@@ -1279,90 +1375,30 @@ pub fn get_mcp_server_status(state: State<'_, McpServerState>) -> Result<McpServ
     Ok(state.inner.lock().unwrap().status.clone())
 }
 
-#[tauri::command]
-pub fn mcp_submit_tool_response(
-    request_id: String,
-    response: McpToolResponse,
-    state: State<'_, McpServerState>,
-) -> Result<(), String> {
-    let sender = state.inner.lock().unwrap().pending.remove(&request_id);
-    let Some(sender) = sender else {
-        return Err(format!(
-            "No pending MCP tool request found for {request_id}."
-        ));
-    };
+// ── Event-based handlers (used instead of invoke for secondary-window compat) ──
 
-    sender
-        .send(response)
-        .map_err(|error| format!("Failed to send MCP tool response: {error}"))
+fn parse_event<T: serde::de::DeserializeOwned>(raw: &str) -> Option<T> {
+    serde_json::from_str(raw)
+        .map_err(|e| eprintln!("[mcp] Failed to parse event payload: {e}"))
+        .ok()
 }
 
-#[tauri::command]
-pub fn mcp_update_window_context(
-    window: Window,
-    payload: WindowContextPayload,
-    state: State<'_, McpServerState>,
-) -> Result<(), String> {
-    let label = window.label().to_string();
-    let normalized_root = payload
-        .workspace_root
-        .as_deref()
-        .and_then(normalize_workspace_root);
-    let title = payload.title.unwrap_or_else(|| "OpenSCAD Studio".into());
-    let render_target_path = payload.render_target_path.clone();
-    let is_focused = window.is_focused().unwrap_or(false);
-
-    let mut inner = state.inner.lock().unwrap();
-    let next_focus_order = if is_focused {
-        inner.next_focus_order += 1;
-        inner.next_focus_order
-    } else {
-        inner
-            .workspaces
-            .get(&label)
-            .map(|workspace| workspace.last_focused_order)
-            .unwrap_or(0)
-    };
-    let previous_bridge_ready = inner
-        .workspaces
-        .get(&label)
-        .map(|workspace| workspace.bridge_ready)
-        .unwrap_or(false);
-
-    inner.workspaces.insert(
-        label.clone(),
-        RegisteredWorkspace {
-            descriptor: WorkspaceDescriptor {
-                window_id: label.clone(),
-                title,
-                workspace_root: normalized_root,
-                render_target_path,
-                is_focused,
-            },
-            show_welcome: payload.show_welcome,
-            mode: payload.mode.unwrap_or(if payload.show_welcome {
-                RegisteredWindowMode::Welcome
-            } else {
-                RegisteredWindowMode::Ready
-            }),
-            pending_request_id: payload.pending_request_id,
-            context_ready: payload.ready,
-            bridge_ready: previous_bridge_ready,
-            last_focused_order: next_focus_order,
-        },
-    );
-
-    Ok(())
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct EventEnvelope<T> {
+    window_label: String,
+    #[serde(flatten)]
+    inner: T,
 }
 
-#[tauri::command]
-pub fn mcp_mark_window_bridge_ready(
-    window: Window,
-    state: State<'_, McpServerState>,
-) -> Result<(), String> {
-    let label = window.label().to_string();
-    let is_focused = window.is_focused().unwrap_or(false);
+#[derive(Deserialize)]
+struct EmptyPayload {}
 
+pub fn handle_bridge_ready_event(state: &McpServerState, raw: &str) {
+    let Some(env) = parse_event::<EventEnvelope<EmptyPayload>>(raw) else {
+        return;
+    };
+    let label = env.window_label;
     let mut inner = state.inner.lock().unwrap();
     let workspace = inner
         .workspaces
@@ -1373,36 +1409,105 @@ pub fn mcp_mark_window_bridge_ready(
                 title: "OpenSCAD Studio".into(),
                 workspace_root: None,
                 render_target_path: None,
-                is_focused,
+                is_focused: false,
             },
             show_welcome: true,
             mode: RegisteredWindowMode::Welcome,
             pending_request_id: None,
+            startup_phase: "created".into(),
+            startup_detail: None,
             context_ready: false,
             bridge_ready: false,
             last_focused_order: 0,
         });
     workspace.bridge_ready = true;
-
-    Ok(())
+    workspace.startup_phase = "bridge_ready".into();
+    workspace.startup_detail = None;
 }
 
-#[derive(Clone, Debug, Deserialize)]
+#[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct WindowOpenResultPayload {
-    pub request_id: String,
-    pub success: bool,
-    pub message: Option<String>,
-    pub opened_workspace_root: Option<String>,
+struct ToolResponsePayload {
+    request_id: String,
+    response: McpToolResponse,
 }
 
-#[tauri::command]
-pub fn report_window_open_result(
-    window: Window,
-    payload: WindowOpenResultPayload,
-    state: State<'_, McpServerState>,
-) -> Result<(), String> {
-    let label = window.label().to_string();
+pub fn handle_tool_response_event(state: &McpServerState, raw: &str) {
+    let Some(env) = parse_event::<EventEnvelope<ToolResponsePayload>>(raw) else {
+        return;
+    };
+    let sender = state.inner.lock().unwrap().pending.remove(&env.inner.request_id);
+    if let Some(sender) = sender {
+        let _ = sender.send(env.inner.response);
+    }
+}
+
+pub fn handle_window_context_event(state: &McpServerState, raw: &str) {
+    let Some(env) = parse_event::<EventEnvelope<WindowContextPayload>>(raw) else {
+        return;
+    };
+    let label = env.window_label;
+    let payload = env.inner;
+    let normalized_root = payload
+        .workspace_root
+        .as_deref()
+        .and_then(normalize_workspace_root);
+    let title = payload.title.unwrap_or_else(|| "OpenSCAD Studio".into());
+    let render_target_path = payload.render_target_path.clone();
+
+    let mut inner = state.inner.lock().unwrap();
+    let next_focus_order = inner
+        .workspaces
+        .get(&label)
+        .map(|w| w.last_focused_order)
+        .unwrap_or(0);
+    let previous_bridge_ready = inner
+        .workspaces
+        .get(&label)
+        .map(|w| w.bridge_ready)
+        .unwrap_or(false);
+    let previous_startup_phase = inner
+        .workspaces
+        .get(&label)
+        .map(|w| w.startup_phase.clone())
+        .unwrap_or_else(|| "context_updated".into());
+    let previous_startup_detail = inner
+        .workspaces
+        .get(&label)
+        .and_then(|w| w.startup_detail.clone());
+
+    inner.workspaces.insert(
+        label.clone(),
+        RegisteredWorkspace {
+            descriptor: WorkspaceDescriptor {
+                window_id: label,
+                title,
+                workspace_root: normalized_root,
+                render_target_path,
+                is_focused: false,
+            },
+            show_welcome: payload.show_welcome,
+            mode: payload.mode.unwrap_or(if payload.show_welcome {
+                RegisteredWindowMode::Welcome
+            } else {
+                RegisteredWindowMode::Ready
+            }),
+            pending_request_id: payload.pending_request_id,
+            startup_phase: previous_startup_phase,
+            startup_detail: previous_startup_detail,
+            context_ready: payload.ready,
+            bridge_ready: previous_bridge_ready,
+            last_focused_order: next_focus_order,
+        },
+    );
+}
+
+pub fn handle_window_open_result_event(state: &McpServerState, raw: &str) {
+    let Some(env) = parse_event::<EventEnvelope<WindowOpenResultPayload>>(raw) else {
+        return;
+    };
+    let label = env.window_label;
+    let payload = env.inner;
     let mut inner = state.inner.lock().unwrap();
 
     inner
@@ -1414,11 +1519,13 @@ pub fn report_window_open_result(
                 title: "OpenSCAD Studio".into(),
                 workspace_root: None,
                 render_target_path: None,
-                is_focused: window.is_focused().unwrap_or(false),
+                is_focused: false,
             },
             show_welcome: true,
             mode: RegisteredWindowMode::Welcome,
             pending_request_id: None,
+            startup_phase: "created".into(),
+            startup_detail: None,
             context_ready: false,
             bridge_ready: false,
             last_focused_order: 0,
@@ -1439,14 +1546,14 @@ pub fn report_window_open_result(
             } else {
                 RegisteredWindowMode::OpenFailed
             };
+            workspace.startup_phase = if payload.success {
+                "open_request_succeeded".into()
+            } else {
+                "open_request_failed".into()
+            };
+            workspace.startup_detail = payload.message.clone();
         }
-        eprintln!(
-            "[mcp] report_window_open_result window={} request_id={} success={} workspace_root={}",
-            label,
-            payload.request_id,
-            payload.success,
-            payload.opened_workspace_root.as_deref().unwrap_or("(none)")
-        );
+
         let result = if payload.success {
             Ok(WindowOpenResult {
                 message: payload
@@ -1460,11 +1567,155 @@ pub fn report_window_open_result(
         } else {
             Err(payload
                 .message
-                .unwrap_or_else(|| "Failed to open the requested target.".into()))
+                .unwrap_or_else(|| "Failed to open target.".into()))
         };
         let _ = pending.sender.send(result);
     }
+}
 
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StartupPhaseEventPayload {
+    phase: String,
+    detail: Option<String>,
+}
+
+pub fn handle_window_startup_phase_event(state: &McpServerState, raw: &str) {
+    let Some(env) = parse_event::<EventEnvelope<StartupPhaseEventPayload>>(raw) else {
+        return;
+    };
+    record_window_startup_phase(state, &env.window_label, env.inner.phase, env.inner.detail);
+}
+
+// ── Tauri command handlers (invoke-based) ──
+
+#[tauri::command]
+pub async fn mcp_submit_tool_response(
+    request_id: String,
+    response: McpToolResponse,
+    state: State<'_, McpServerState>,
+) -> Result<(), String> {
+    let sender = state.inner.lock().unwrap().pending.remove(&request_id);
+    let Some(sender) = sender else {
+        return Err(format!("No pending MCP tool request found for {request_id}."));
+    };
+    sender
+        .send(response)
+        .map_err(|error| format!("Failed to send MCP tool response: {error}"))
+}
+
+#[tauri::command]
+pub async fn mcp_update_window_context(
+    window: Window,
+    payload: WindowContextPayload,
+    state: State<'_, McpServerState>,
+) -> Result<(), String> {
+    let label = window.label().to_string();
+    let normalized_root = payload.workspace_root.as_deref().and_then(normalize_workspace_root);
+    let title = payload.title.unwrap_or_else(|| "OpenSCAD Studio".into());
+    let render_target_path = payload.render_target_path.clone();
+    let is_focused = window.is_focused().unwrap_or(false);
+
+    let mut inner = state.inner.lock().unwrap();
+    let next_focus_order = if is_focused {
+        inner.next_focus_order += 1;
+        inner.next_focus_order
+    } else {
+        inner.workspaces.get(&label).map(|w| w.last_focused_order).unwrap_or(0)
+    };
+    let previous_bridge_ready = inner.workspaces.get(&label).map(|w| w.bridge_ready).unwrap_or(false);
+    let previous_startup_phase = inner.workspaces.get(&label).map(|w| w.startup_phase.clone()).unwrap_or_else(|| "context_updated".into());
+    let previous_startup_detail = inner.workspaces.get(&label).and_then(|w| w.startup_detail.clone());
+
+    inner.workspaces.insert(label.clone(), RegisteredWorkspace {
+        descriptor: WorkspaceDescriptor { window_id: label, title, workspace_root: normalized_root, render_target_path, is_focused },
+        show_welcome: payload.show_welcome,
+        mode: payload.mode.unwrap_or(if payload.show_welcome { RegisteredWindowMode::Welcome } else { RegisteredWindowMode::Ready }),
+        pending_request_id: payload.pending_request_id,
+        startup_phase: previous_startup_phase,
+        startup_detail: previous_startup_detail,
+        context_ready: payload.ready,
+        bridge_ready: previous_bridge_ready,
+        last_focused_order: next_focus_order,
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn mcp_mark_window_bridge_ready(
+    window: Window,
+    state: State<'_, McpServerState>,
+) -> Result<(), String> {
+    let label = window.label().to_string();
+    let is_focused = window.is_focused().unwrap_or(false);
+    let mut inner = state.inner.lock().unwrap();
+    let workspace = inner.workspaces.entry(label.clone()).or_insert_with(|| RegisteredWorkspace {
+        descriptor: WorkspaceDescriptor { window_id: label, title: "OpenSCAD Studio".into(), workspace_root: None, render_target_path: None, is_focused },
+        show_welcome: true, mode: RegisteredWindowMode::Welcome, pending_request_id: None,
+        startup_phase: "created".into(), startup_detail: None,
+        context_ready: false, bridge_ready: false, last_focused_order: 0,
+    });
+    workspace.bridge_ready = true;
+    workspace.startup_phase = "bridge_ready".into();
+    workspace.startup_detail = None;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn mcp_report_window_startup_phase(
+    window: Window,
+    payload: WindowStartupPhasePayload,
+    state: State<'_, McpServerState>,
+) -> Result<(), String> {
+    record_window_startup_phase(&state, window.label(), payload.phase, payload.detail);
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WindowOpenResultPayload {
+    pub request_id: String,
+    pub success: bool,
+    pub message: Option<String>,
+    pub opened_workspace_root: Option<String>,
+}
+
+#[tauri::command]
+pub async fn report_window_open_result(
+    window: Window,
+    payload: WindowOpenResultPayload,
+    state: State<'_, McpServerState>,
+) -> Result<(), String> {
+    let label = window.label().to_string();
+    let mut inner = state.inner.lock().unwrap();
+    inner.workspaces.entry(label.clone()).or_insert_with(|| RegisteredWorkspace {
+        descriptor: WorkspaceDescriptor { window_id: label.clone(), title: "OpenSCAD Studio".into(), workspace_root: None, render_target_path: None, is_focused: false },
+        show_welcome: true, mode: RegisteredWindowMode::Welcome, pending_request_id: None,
+        startup_phase: "created".into(), startup_detail: None,
+        context_ready: false, bridge_ready: false, last_focused_order: 0,
+    });
+
+    if let Some(pending) = inner.window_open_requests.remove(&payload.request_id) {
+        if let Some(workspace) = inner.workspaces.get_mut(&label) {
+            workspace.pending_request_id = None;
+            workspace.mode = if payload.success {
+                if payload.opened_workspace_root.is_some() { workspace.show_welcome = false; RegisteredWindowMode::Ready }
+                else if workspace.show_welcome { RegisteredWindowMode::Welcome }
+                else { RegisteredWindowMode::Ready }
+            } else { RegisteredWindowMode::OpenFailed };
+            workspace.startup_phase = if payload.success { "open_request_succeeded".into() } else { "open_request_failed".into() };
+            workspace.startup_detail = payload.message.clone();
+        }
+        let result = if payload.success {
+            Ok(WindowOpenResult {
+                message: payload.message.unwrap_or_else(|| "Opened target successfully.".into()),
+                opened_workspace_root: payload.opened_workspace_root.as_deref().and_then(normalize_workspace_root),
+            })
+        } else {
+            Err(payload.message.unwrap_or_else(|| "Failed to open target.".into()))
+        };
+        let _ = pending.sender.send(result);
+    }
     Ok(())
 }
 
@@ -1512,6 +1763,12 @@ mod tests {
                 RegisteredWindowMode::Ready
             },
             pending_request_id: None,
+            startup_phase: if show_welcome {
+                "welcome_ready".into()
+            } else {
+                "ready".into()
+            },
+            startup_detail: None,
             context_ready: true,
             bridge_ready: true,
             last_focused_order: 0,
@@ -1659,6 +1916,8 @@ mod tests {
                     show_welcome: false,
                     mode: RegisteredWindowMode::Ready,
                     pending_request_id: None,
+                    startup_phase: "ready".into(),
+                    startup_detail: None,
                     context_ready: true,
                     bridge_ready: false,
                     last_focused_order: 1,
@@ -1696,6 +1955,8 @@ mod tests {
                     show_welcome: false,
                     mode: RegisteredWindowMode::Ready,
                     pending_request_id: None,
+                    startup_phase: "ready".into(),
+                    startup_detail: None,
                     context_ready: true,
                     bridge_ready: true,
                     last_focused_order: 1,

@@ -19,6 +19,15 @@ import type {
   PlatformCapabilities,
 } from './types';
 
+function emitStartupPhase(phase: string, detail?: string) {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(
+    new CustomEvent('openscad:startup-phase', {
+      detail: { phase, detail: detail ?? null },
+    })
+  );
+}
+
 let _bridge: PlatformBridge | null = null;
 
 function isTauri(): boolean {
@@ -172,15 +181,21 @@ export async function initializePlatform(): Promise<PlatformBridge> {
   }
 
   if (isTauri()) {
+    emitStartupPhase('platform_import_tauri_bridge_begin');
     const { TauriBridge } = await import('./tauriBridge');
+    emitStartupPhase('platform_import_tauri_bridge_done');
     _bridge = new TauriBridge();
   } else {
+    emitStartupPhase('platform_import_web_bridge_begin');
     const { WebBridge } = await import('./webBridge');
+    emitStartupPhase('platform_import_web_bridge_done');
     _bridge = new WebBridge();
   }
 
   if (_bridge.initialize) {
+    emitStartupPhase('platform_bridge_initialize_begin');
     await _bridge.initialize();
+    emitStartupPhase('platform_bridge_initialize_done');
   }
 
   return _bridge;

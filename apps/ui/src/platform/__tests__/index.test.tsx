@@ -70,10 +70,35 @@ describe('platform bootstrap', () => {
   it('selects the tauri bridge when tauri internals are present', async () => {
     (window as Window & { __TAURI_INTERNALS__?: unknown }).__TAURI_INTERNALS__ = {};
     const listen = jest.fn(async () => jest.fn());
+    const onFocusChanged = jest.fn(async () => jest.fn());
     jest.unstable_mockModule('@tauri-apps/api/window', () => ({
       getCurrentWindow: () => ({
         listen,
+        onFocusChanged,
+        setTitle: jest.fn(),
       }),
+    }));
+    jest.unstable_mockModule('@tauri-apps/api/path', () => ({
+      homeDir: jest.fn(),
+      join: jest.fn(),
+      documentDir: jest.fn(),
+    }));
+    jest.unstable_mockModule('@tauri-apps/plugin-dialog', () => ({
+      open: jest.fn(),
+      save: jest.fn(),
+      confirm: jest.fn(),
+      ask: jest.fn(),
+    }));
+    jest.unstable_mockModule('@tauri-apps/plugin-fs', () => ({
+      readTextFile: jest.fn(),
+      writeTextFile: jest.fn(),
+      writeFile: jest.fn(),
+      readDir: jest.fn(),
+      exists: jest.fn(),
+      mkdir: jest.fn(),
+      remove: jest.fn(),
+      rename: jest.fn(),
+      watch: jest.fn(),
     }));
 
     const platform = await import('../index');

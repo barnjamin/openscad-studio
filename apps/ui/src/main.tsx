@@ -16,14 +16,16 @@ import { getPlatform, initializePlatform } from './platform';
 import {
   consumeDesktopBootstrapLaunchIntent,
   initializeDesktopMcpBridge,
+  reportDesktopWindowStartupPhase,
   reportDesktopWindowOpenResult,
   syncDesktopMcpWindowContext,
+  type DesktopWindowStartupPhase,
   type DesktopWindowLaunchIntent,
   type DesktopWindowOpenRequest,
 } from './services/desktopMcp';
 import { openFileInWindow, openWorkspaceFolderInWindow } from './services/windowOpenService';
 import { captureSentryException } from './sentry';
-import { getProjectState } from './stores/projectStore';
+import { getProjectState, getProjectStore } from './stores/projectStore';
 import { loadSettings } from './stores/settingsStore';
 import { workspaceStore } from './stores/workspaceStore';
 import { initFormatter } from './utils/formatter';
@@ -290,15 +292,35 @@ function normalizeErrorMessage(error: unknown, fallback: string): string {
   return error instanceof Error ? error.message : fallback;
 }
 
+function resetWindowToWelcomeState() {
+  getProjectStore().getState().resetToUntitledProject();
+  workspaceStore.getState().resetWorkspace();
+}
+
 function BootstrapApp() {
   const [startupError, setStartupError] = useState<unknown>(null);
   const [platformReady, setPlatformReady] = useState(false);
   const [windowState, setWindowState] = useState<BootstrapWindowState>(INITIAL_WINDOW_STATE);
-  const [bridgeReady, setBridgeReady] = useState(false);
+  const [bootDetail, setBootDetail] = useState('Loading the editor and desktop services for this window.');
+  const bridgeReadyRef = useRef(false);
+  const bootstrapStartedRef = useRef(false);
   const activeRequestRef = useRef<{
     key: string;
     promise: Promise<void>;
   } | null>(null);
+
+  const reportStartupPhase = useCallback(
+    (phase: DesktopWindowStartupPhase, detail?: string | null) => {
+      if (!getPlatform().capabilities.hasFileSystem) {
+        return;
+      }
+
+      void reportDesktopWindowStartupPhase({ phase, detail }).catch((error) => {
+        console.error('[main] Failed to report startup phase:', phase, error);
+      });
+    },
+    []
+  );
 
   const syncWindowContext = useCallback(
     async (
@@ -309,7 +331,7 @@ function BootstrapApp() {
         renderTargetPath?: string | null;
       }
     ) => {
-      if (!bridgeReady || !getPlatform().capabilities.hasFileSystem) {
+      if (!bridgeReadyRef.current || !getPlatform().capabilities.hasFileSystem) {
         return;
       }
 
@@ -330,7 +352,7 @@ function BootstrapApp() {
         pendingRequestId: args?.requestId ?? null,
       });
     },
-    [bridgeReady]
+    []
   );
 
   const runOpenRequest = useCallback(
@@ -339,6 +361,7 @@ function BootstrapApp() {
       options: {
         requestId?: string;
         reportResult?: boolean;
+        preReadFiles?: Record<string, string>;
       } = {}
     ) => {
       const key =
@@ -377,7 +400,11 @@ function BootstrapApp() {
         failedRequest: null,
       };
       setWindowState(nextWindowState);
-      await syncWindowContext(nextWindowState, {
+      reportStartupPhase(
+        'open_request_started',
+        request.kind === 'open_folder' ? request.folder_path : request.file_path
+      );
+      void syncWindowContext(nextWindowState, {
         requestId: options.requestId ?? null,
         workspaceRoot: null,
         renderTargetPath: null,
@@ -388,6 +415,7 @@ function BootstrapApp() {
           if (request.kind === 'open_folder') {
             const result = await openWorkspaceFolderInWindow(request.folder_path, {
               createIfEmpty: request.create_if_empty,
+              preReadFiles: options.preReadFiles,
             });
             const readyState: BootstrapWindowState = {
               mode: 'ready',
@@ -396,13 +424,14 @@ function BootstrapApp() {
               failedRequest: null,
             };
             setWindowState(readyState);
-            await syncWindowContext(readyState, {
+            reportStartupPhase('open_request_succeeded', result.workspaceRoot);
+            void syncWindowContext(readyState, {
               workspaceRoot: result.workspaceRoot,
               renderTargetPath: result.renderTargetPath,
             });
             if (options.reportResult && options.requestId) {
               const action = result.createdDefaultFile ? 'Created' : 'Opened';
-              await reportDesktopWindowOpenResult({
+              void reportDesktopWindowOpenResult({
                 requestId: options.requestId,
                 success: true,
                 message: `✅ ${action} workspace at ${request.folder_path}.\n\nRender target: ${result.renderTargetPath}`,
@@ -424,12 +453,13 @@ function BootstrapApp() {
             failedRequest: null,
           };
           setWindowState(readyState);
-          await syncWindowContext(readyState, {
+          reportStartupPhase('open_request_succeeded', request.file_path);
+          void syncWindowContext(readyState, {
             workspaceRoot: result.projectRoot,
             renderTargetPath: result.projectPath,
           });
           if (options.reportResult && options.requestId) {
-            await reportDesktopWindowOpenResult({
+            void reportDesktopWindowOpenResult({
               requestId: options.requestId,
               success: true,
               message: `✅ Opened file at ${request.file_path}.`,
@@ -445,12 +475,13 @@ function BootstrapApp() {
             failedRequest: request,
           };
           setWindowState(failedState);
-          await syncWindowContext(failedState, {
+          reportStartupPhase('open_request_failed', message);
+          void syncWindowContext(failedState, {
             workspaceRoot: null,
             renderTargetPath: null,
           });
           if (options.reportResult && options.requestId) {
-            await reportDesktopWindowOpenResult({
+            void reportDesktopWindowOpenResult({
               requestId: options.requestId,
               success: false,
               message,
@@ -468,13 +499,37 @@ function BootstrapApp() {
         }
       }
     },
-    [syncWindowContext]
+    [reportStartupPhase, syncWindowContext]
   );
 
   useEffect(() => {
+    const handleStartupPhase = (event: Event) => {
+      const detail = (event as CustomEvent<{ phase?: string; detail?: string | null }>).detail;
+      if (!detail?.phase) {
+        return;
+      }
+
+      setBootDetail(detail.detail ? `${detail.phase}: ${detail.detail}` : detail.phase);
+    };
+
+    window.addEventListener('openscad:startup-phase', handleStartupPhase as EventListener);
+    return () => {
+      window.removeEventListener('openscad:startup-phase', handleStartupPhase as EventListener);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (bootstrapStartedRef.current) {
+      return;
+    }
+    bootstrapStartedRef.current = true;
+
     let cancelled = false;
     let bridgeCleanup: (() => void) | null = null;
 
+    void reportStartupPhase('bootstrap_started');
+    void reportStartupPhase('platform_initializing');
+    setBootDetail('initializePlatform');
     void initializePlatform()
       .then(async (platform) => {
         if (cancelled) return;
@@ -486,6 +541,8 @@ function BootstrapApp() {
           });
         }
 
+        reportStartupPhase('platform_ready');
+        setBootDetail('platform_ready');
         setPlatformReady(true);
         void initFormatter().catch((error) => {
           captureSentryException(error, { tags: { phase: 'formatter-init' } });
@@ -493,6 +550,8 @@ function BootstrapApp() {
         });
 
         if (platform.capabilities.hasFileSystem) {
+          reportStartupPhase('bridge_initializing');
+          setBootDetail('initializeDesktopMcpBridge');
           bridgeCleanup = await initializeDesktopMcpBridge({
             onOpenRequest: async (payload) => {
               await runOpenRequest(payload.request, {
@@ -505,21 +564,43 @@ function BootstrapApp() {
             bridgeCleanup?.();
             return;
           }
-          setBridgeReady(true);
+          bridgeReadyRef.current = true;
+          reportStartupPhase('bridge_ready');
+          setBootDetail('bridge_ready');
         }
 
         const launchIntent = consumeDesktopBootstrapLaunchIntent();
         if (launchIntent) {
+          reportStartupPhase(
+            'launch_intent_consumed',
+            launchIntent.kind === 'welcome'
+              ? 'welcome'
+              : launchIntent.kind === 'open_folder'
+                ? launchIntent.folder_path
+                : launchIntent.file_path
+          );
           const request = intentToRequest(launchIntent);
           if (request) {
+            setBootDetail(
+              request.kind === 'open_folder'
+                ? `startup open folder: ${request.folder_path}`
+                : `startup open file: ${request.file_path}`
+            );
             await runOpenRequest(request, {
               requestId: launchIntent.kind === 'welcome' ? undefined : launchIntent.request_id,
               reportResult: launchIntent.kind !== 'welcome',
+              preReadFiles:
+                launchIntent.kind === 'open_folder' && launchIntent.files
+                  ? launchIntent.files
+                  : undefined,
             });
             return;
           }
         }
 
+        reportStartupPhase('launch_intent_none');
+        setBootDetail('welcome_ready');
+        resetWindowToWelcomeState();
         const welcomeState: BootstrapWindowState = {
           mode: 'welcome',
           targetPath: null,
@@ -527,6 +608,7 @@ function BootstrapApp() {
           failedRequest: null,
         };
         setWindowState(welcomeState);
+        reportStartupPhase('welcome_ready');
         if (platform.capabilities.hasFileSystem) {
           await syncDesktopMcpWindowContext({
             title: document.title || 'OpenSCAD Studio',
@@ -541,6 +623,11 @@ function BootstrapApp() {
         if (cancelled) return;
 
         captureSentryException(error, { tags: { phase: 'startup' } });
+        void reportStartupPhase(
+          'startup_error',
+          error instanceof Error ? error.message : String(error)
+        );
+        setBootDetail(error instanceof Error ? error.message : String(error));
         if (shouldCaptureBootstrapEvents) {
           captureBootstrapError(posthog, error, {
             analyticsEnabled,
@@ -556,7 +643,7 @@ function BootstrapApp() {
       cancelled = true;
       bridgeCleanup?.();
     };
-  }, [runOpenRequest]);
+  }, [reportStartupPhase, runOpenRequest]);
 
   const handleRetry = useCallback(() => {
     const failedRequest = windowState.failedRequest;
@@ -595,7 +682,7 @@ function BootstrapApp() {
   }, [runOpenRequest]);
 
   const handleGoToWelcome = useCallback(() => {
-    workspaceStore.getState().resetWorkspace();
+    resetWindowToWelcomeState();
     const welcomeState: BootstrapWindowState = {
       mode: 'welcome',
       targetPath: null,
@@ -614,15 +701,17 @@ function BootstrapApp() {
   }
 
   if (!platformReady || windowState.mode === 'booting') {
-    return renderLoadingScreen();
+    return renderLoadingScreen('Starting OpenSCAD Studio', bootDetail);
   }
 
   if (windowState.mode === 'opening_folder') {
-    return renderLoadingScreen('Opening workspace...', windowState.targetPath ?? '');
+    const detail = [windowState.targetPath, bootDetail].filter(Boolean).join('\n\n');
+    return renderLoadingScreen('Opening workspace...', detail);
   }
 
   if (windowState.mode === 'opening_file') {
-    return renderLoadingScreen('Opening file...', windowState.targetPath ?? '');
+    const detail = [windowState.targetPath, bootDetail].filter(Boolean).join('\n\n');
+    return renderLoadingScreen('Opening file...', detail);
   }
 
   if (windowState.mode === 'open_failed') {
@@ -657,5 +746,26 @@ const shouldCaptureBootstrapEvents = shouldCaptureBootstrapAnalytics(
   posthogReady,
   analyticsEnabled
 );
+
+function reportEarlyStartupPhase(phase: DesktopWindowStartupPhase, detail?: string | null) {
+  void reportDesktopWindowStartupPhase({ phase, detail }).catch((error) => {
+    console.error('[main] Failed to report early startup phase:', phase, error);
+  });
+}
+
+window.addEventListener('error', (event) => {
+  reportEarlyStartupPhase(
+    'window_error',
+    `${event.message} @ ${event.filename}:${event.lineno}:${event.colno}`
+  );
+});
+
+window.addEventListener('unhandledrejection', (event) => {
+  const reason =
+    event.reason instanceof Error ? event.reason.stack || event.reason.message : String(event.reason);
+  reportEarlyStartupPhase('unhandled_rejection', reason);
+});
+
+reportEarlyStartupPhase('module_loaded', document.readyState);
 
 ReactDOM.createRoot(document.getElementById('root') as HTMLElement).render(<BootstrapApp />);

@@ -56,6 +56,8 @@ export type DesktopWindowLaunchIntent =
       request_id: string;
       folder_path: string;
       create_if_empty: boolean;
+      /** Pre-read .scad file contents from the Rust side (relative path → content). */
+      files?: Record<string, string> | null;
     }
   | { kind: 'open_file'; request_id: string; file_path: string };
 
@@ -79,6 +81,34 @@ interface InitializeDesktopMcpBridgeOptions {
 interface DesktopWindowBootstrapPayload {
   launchIntent?: DesktopWindowLaunchIntent | null;
 }
+
+function emitLocalStartupPhase(phase: string, detail?: string) {
+  if (typeof window === 'undefined') return;
+  window.dispatchEvent(
+    new CustomEvent('openscad:startup-phase', {
+      detail: { phase, detail: detail ?? null },
+    })
+  );
+}
+
+export type DesktopWindowStartupPhase =
+  | 'module_loaded'
+  | 'window_error'
+  | 'unhandled_rejection'
+  | 'bootstrap_started'
+  | 'platform_initializing'
+  | 'platform_ready'
+  | 'page_load_started'
+  | 'page_load_finished'
+  | 'bridge_initializing'
+  | 'bridge_ready'
+  | 'launch_intent_consumed'
+  | 'launch_intent_none'
+  | 'open_request_started'
+  | 'open_request_succeeded'
+  | 'open_request_failed'
+  | 'welcome_ready'
+  | 'startup_error';
 
 interface McpTextContent {
   type: 'text';
@@ -132,9 +162,29 @@ const renderWaiters = new Map<
 let nextRenderWaiterId = 1;
 let bridgeUnlistenPromise: Promise<() => void> | null = null;
 
+/**
+ * Gate that resolves when <App /> mounts and the render service is ready.
+ * MCP tool handlers that need the full UI (rendering, screenshots, etc.)
+ * await this before executing.
+ */
+let _appReadyResolve: (() => void) | null = null;
+const _appReadyPromise = new Promise<void>((resolve) => {
+  _appReadyResolve = resolve;
+});
+
+/** Called by <App /> on mount to signal that the render service is available. */
+export function signalAppReady(): void {
+  _appReadyResolve?.();
+}
+
+function waitForAppReady(): Promise<void> {
+  return _appReadyPromise;
+}
+
 function isDesktopTauri(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
 }
+
 
 function textResponse(text: string, isError = false): McpToolResponse {
   return {
@@ -210,6 +260,7 @@ function resolveNextRenderWaiter(snapshot: RenderSnapshotLike) {
 }
 
 async function runRenderAndWait(trigger: RenderTrigger): Promise<RenderSnapshotLike> {
+  await waitForAppReady();
   const pending = waitForNextRender();
   requestRender(trigger, { immediate: true });
   return pending;
@@ -259,20 +310,15 @@ async function handleSetRenderTarget(
     return textResponse(`❌ Render target not found: ${filePath}`, true);
   }
 
-  let snapshot: RenderSnapshotLike;
-  if (state.renderTargetPath === normalizedPath) {
-    snapshot = await runRenderAndWait('manual');
-  } else {
-    const pending = waitForNextRender();
+  if (state.renderTargetPath !== normalizedPath) {
     getProjectStore().getState().setRenderTarget(normalizedPath);
-    snapshot = await pending;
   }
+  requestRender('manual', { immediate: true });
 
   return textResponse(
-    `✅ Render target changed to ${normalizedPath}.\n\n${formatDiagnostics(
-      snapshot.diagnostics,
-      snapshot.error
-    )}`
+    state.renderTargetPath === normalizedPath
+      ? `✅ Render target remains ${normalizedPath}. A fresh render has been requested.`
+      : `✅ Render target changed to ${normalizedPath}. A render has been requested for the new target.`
   );
 }
 
@@ -294,6 +340,7 @@ async function handleTriggerRender(): Promise<McpToolResponse> {
 async function handlePreviewScreenshot(
   argumentsValue: Record<string, unknown>
 ): Promise<McpToolResponse> {
+  await waitForAppReady();
   const result = await capturePreviewScreenshot({
     ...buildScreenshotCallbacks(),
     view:
@@ -467,9 +514,15 @@ export async function initializeDesktopMcpBridge(
 
   if (!bridgeUnlistenPromise) {
     bridgeUnlistenPromise = (async () => {
+      emitLocalStartupPhase('desktop_mcp_bridge_begin');
       const { getCurrentWindow } = await import('@tauri-apps/api/window');
+      emitLocalStartupPhase('desktop_mcp_bridge_window_api_imported');
       const currentWindow = getCurrentWindow();
+      emitLocalStartupPhase('desktop_mcp_bridge_current_window_acquired');
+      let unlistenOpenRequest: (() => void) | null = null;
+      let unlistenFocus: (() => void) | null = null;
 
+      emitLocalStartupPhase('desktop_mcp_bridge_listen_tool_request_begin');
       const unlistenToolRequest = await currentWindow.listen<McpToolRequestPayload>(
         'mcp:tool-request',
         async (event) => {
@@ -490,15 +543,19 @@ export async function initializeDesktopMcpBridge(
           }
         }
       );
+      emitLocalStartupPhase('desktop_mcp_bridge_listen_tool_request_done');
 
-      const unlistenOpenRequest = await currentWindow.listen<DesktopWindowOpenRequestPayload>(
+      emitLocalStartupPhase('desktop_mcp_bridge_listen_open_request_begin');
+      unlistenOpenRequest = await currentWindow.listen<DesktopWindowOpenRequestPayload>(
         'desktop:open-request',
         async (event) => {
           await options.onOpenRequest?.(event.payload);
         }
       );
+      emitLocalStartupPhase('desktop_mcp_bridge_listen_open_request_done');
 
-      const unlistenFocus = await currentWindow.onFocusChanged(() => {
+      emitLocalStartupPhase('desktop_mcp_bridge_focus_hook_begin');
+      unlistenFocus = await currentWindow.onFocusChanged(() => {
         void syncDesktopMcpWindowContext({
           title: document.title || 'OpenSCAD Studio',
           workspaceRoot: getProjectState().projectRoot,
@@ -507,20 +564,35 @@ export async function initializeDesktopMcpBridge(
           mode: getWorkspaceState().showWelcome ? 'welcome' : 'ready',
         });
       });
+      emitLocalStartupPhase('desktop_mcp_bridge_focus_hook_done');
 
+      emitLocalStartupPhase('desktop_mcp_bridge_mark_ready_begin');
       await invoke('mcp_mark_window_bridge_ready');
-      await syncDesktopMcpWindowContext({
+      emitLocalStartupPhase('desktop_mcp_bridge_mark_ready_done');
+
+      emitLocalStartupPhase('desktop_mcp_bridge_sync_context_begin');
+      void syncDesktopMcpWindowContext({
         title: document.title || 'OpenSCAD Studio',
         workspaceRoot: getProjectState().projectRoot,
         renderTargetPath: getProjectState().renderTargetPath,
         showWelcome: getWorkspaceState().showWelcome,
         mode: getWorkspaceState().showWelcome ? 'welcome' : 'ready',
-      });
+      })
+        .then(() => {
+          emitLocalStartupPhase('desktop_mcp_bridge_sync_context_done');
+        })
+        .catch((error) => {
+          emitLocalStartupPhase(
+            'desktop_mcp_bridge_sync_context_failed',
+            error instanceof Error ? error.message : String(error)
+          );
+          console.error('[desktopMcp] Initial syncDesktopMcpWindowContext failed:', error);
+        });
 
       return () => {
         unlistenToolRequest();
-        unlistenOpenRequest();
-        unlistenFocus();
+        unlistenOpenRequest?.();
+        unlistenFocus?.();
       };
     })();
   }
@@ -611,6 +683,19 @@ export async function reportDesktopWindowOpenResult(payload: {
       message: payload.message ?? null,
       openedWorkspaceRoot: payload.openedWorkspaceRoot ?? null,
       openedFilePath: payload.openedFilePath ?? null,
+    },
+  });
+}
+
+export async function reportDesktopWindowStartupPhase(payload: {
+  phase: DesktopWindowStartupPhase;
+  detail?: string | null;
+}): Promise<void> {
+  if (!isDesktopTauri()) return;
+  await invoke('mcp_report_window_startup_phase', {
+    payload: {
+      phase: payload.phase,
+      detail: payload.detail ?? null,
     },
   });
 }
