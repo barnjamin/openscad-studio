@@ -243,7 +243,10 @@ async function readRenderTargetFromDisk(): Promise<string | null> {
   return result?.content ?? null;
 }
 
-async function runRenderAndWait(trigger: RenderTrigger, code?: string): Promise<RenderSnapshotLike> {
+async function runRenderAndWait(
+  trigger: RenderTrigger,
+  code?: string
+): Promise<RenderSnapshotLike> {
   const pending = waitForNextRender();
   requestRender(trigger, { immediate: true, code });
   return pending;

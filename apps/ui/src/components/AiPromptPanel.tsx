@@ -206,7 +206,9 @@ export const AiPromptPanel = forwardRef<AiPromptPanelRef, AiPromptPanelProps>(
       if (!node) return;
 
       const updateLayout = (width: number, height: number) => {
-        setEmptyStatePanelLayout(width >= 760 && width / Math.max(height, 1) >= 1.45 ? 'split' : 'stacked');
+        setEmptyStatePanelLayout(
+          width >= 760 && width / Math.max(height, 1) >= 1.45 ? 'split' : 'stacked'
+        );
       };
 
       const rect = node.getBoundingClientRect();

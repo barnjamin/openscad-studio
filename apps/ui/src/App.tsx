@@ -461,7 +461,9 @@ function App() {
     async (filePath: string | null, fileName: string, content: string) => {
       if (!filePath) {
         const name = fileName || DEFAULT_TAB_NAME;
-        getProjectStore().getState().openProject(null, { [name]: content }, name);
+        getProjectStore()
+          .getState()
+          .openProject(null, { [name]: content }, name);
         return;
       }
 

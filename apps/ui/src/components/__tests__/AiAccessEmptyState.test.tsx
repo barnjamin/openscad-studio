@@ -24,9 +24,7 @@ describe('AiAccessEmptyState', () => {
       'true'
     );
     expect(screen.getByText(/claude mcp add --transport http --scope user/i)).toBeTruthy();
-    expect(
-      screen.getByText(/register OpenSCAD Studio as an MCP server\./i)
-    ).toBeTruthy();
+    expect(screen.getByText(/register OpenSCAD Studio as an MCP server\./i)).toBeTruthy();
     expect(screen.queryByText(/codex mcp add openscad-studio --url/i)).toBeNull();
 
     const cursorTab = screen.getByRole('tab', { name: /Cursor/i });

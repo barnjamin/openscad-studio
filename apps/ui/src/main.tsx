@@ -301,7 +301,9 @@ function BootstrapApp() {
   const [startupError, setStartupError] = useState<unknown>(null);
   const [platformReady, setPlatformReady] = useState(false);
   const [windowState, setWindowState] = useState<BootstrapWindowState>(INITIAL_WINDOW_STATE);
-  const [bootDetail, setBootDetail] = useState('Loading the editor and desktop services for this window.');
+  const [bootDetail, setBootDetail] = useState(
+    'Loading the editor and desktop services for this window.'
+  );
   const bridgeReadyRef = useRef(false);
   const bootstrapStartedRef = useRef(false);
   const activeRequestRef = useRef<{
@@ -758,7 +760,9 @@ window.addEventListener('error', (event) => {
 
 window.addEventListener('unhandledrejection', (event) => {
   const reason =
-    event.reason instanceof Error ? event.reason.stack || event.reason.message : String(event.reason);
+    event.reason instanceof Error
+      ? event.reason.stack || event.reason.message
+      : String(event.reason);
   reportEarlyStartupPhase('unhandled_rejection', reason);
 });
 

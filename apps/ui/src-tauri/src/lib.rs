@@ -31,8 +31,7 @@ pub(crate) fn create_new_window_with_launch_intent(
         let _ = tx.send(result);
     })?;
 
-    rx.recv()
-        .map_err(|e| tauri::Error::Anyhow(e.into()))??;
+    rx.recv().map_err(|e| tauri::Error::Anyhow(e.into()))??;
     Ok(label)
 }
 
