@@ -361,7 +361,6 @@ function BootstrapApp() {
       options: {
         requestId?: string;
         reportResult?: boolean;
-        preReadFiles?: Record<string, string>;
       } = {}
     ) => {
       const key =
@@ -404,7 +403,7 @@ function BootstrapApp() {
         'open_request_started',
         request.kind === 'open_folder' ? request.folder_path : request.file_path
       );
-      void syncWindowContext(nextWindowState, {
+      await syncWindowContext(nextWindowState, {
         requestId: options.requestId ?? null,
         workspaceRoot: null,
         renderTargetPath: null,
@@ -415,7 +414,6 @@ function BootstrapApp() {
           if (request.kind === 'open_folder') {
             const result = await openWorkspaceFolderInWindow(request.folder_path, {
               createIfEmpty: request.create_if_empty,
-              preReadFiles: options.preReadFiles,
             });
             const readyState: BootstrapWindowState = {
               mode: 'ready',
@@ -431,7 +429,7 @@ function BootstrapApp() {
             });
             if (options.reportResult && options.requestId) {
               const action = result.createdDefaultFile ? 'Created' : 'Opened';
-              void reportDesktopWindowOpenResult({
+              await reportDesktopWindowOpenResult({
                 requestId: options.requestId,
                 success: true,
                 message: `✅ ${action} workspace at ${request.folder_path}.\n\nRender target: ${result.renderTargetPath}`,
@@ -589,10 +587,6 @@ function BootstrapApp() {
             await runOpenRequest(request, {
               requestId: launchIntent.kind === 'welcome' ? undefined : launchIntent.request_id,
               reportResult: launchIntent.kind !== 'welcome',
-              preReadFiles:
-                launchIntent.kind === 'open_folder' && launchIntent.files
-                  ? launchIntent.files
-                  : undefined,
             });
             return;
           }

@@ -18,8 +18,6 @@ export interface OpenWorkspaceFolderOptions {
   requestRender?: boolean;
   trackRecent?: boolean;
   platform?: FileOpenPlatform;
-  /** Pre-read file contents — bypasses FS calls when provided (used by secondary windows). */
-  preReadFiles?: Record<string, string>;
 }
 
 export interface OpenWorkspaceFolderResult {
@@ -43,18 +41,6 @@ export interface OpenFileInWindowResult {
   activeTabId: string;
   fileCount: number;
   reusedExistingTab: boolean;
-}
-
-function emitStartupDetail(phase: string, detail?: string) {
-  if (typeof window === 'undefined') return;
-  window.dispatchEvent(
-    new CustomEvent('openscad:startup-phase', {
-      detail: {
-        phase,
-        detail: detail ?? null,
-      },
-    })
-  );
 }
 
 function revokeBlobUrl(url: string | null | undefined) {
@@ -158,31 +144,10 @@ export async function openWorkspaceFolderInWindow(
   options: OpenWorkspaceFolderOptions = {}
 ): Promise<OpenWorkspaceFolderResult> {
   const platform = options.platform ?? getPlatform();
-  emitStartupDetail('workspace_open_begin', dirPath);
 
-  let workspace;
-  if (options.preReadFiles && Object.keys(options.preReadFiles).length > 0) {
-    // Use pre-read files from the Rust side (avoids FS plugin IPC in secondary windows).
-    const files = options.preReadFiles;
-    const filePaths = Object.keys(files);
-    const renderTargetPath =
-      filePaths.find((p) => p === DEFAULT_TAB_NAME) ??
-      [...filePaths].sort((a, b) => a.localeCompare(b))[0];
-    workspace = {
-      files,
-      renderTargetPath,
-      emptyFolders: [] as string[],
-      createdDefaultFile: false,
-    };
-  } else {
-    workspace = await loadWorkspaceFolder(platform, dirPath, {
-      createIfEmpty: options.createIfEmpty,
-    });
-  }
-  emitStartupDetail(
-    'workspace_open_loaded',
-    `${Object.keys(workspace.files).length} file(s), target ${workspace.renderTargetPath}`
-  );
+  const workspace = await loadWorkspaceFolder(platform, dirPath, {
+    createIfEmpty: options.createIfEmpty,
+  });
 
   const activeTabId = hydrateWindowWorkspace({
     projectRoot: dirPath,
@@ -191,21 +156,17 @@ export async function openWorkspaceFolderInWindow(
     activeProjectPath: workspace.renderTargetPath,
     activeFilePath: `${dirPath}/${workspace.renderTargetPath}`,
   });
-  emitStartupDetail('workspace_open_hydrated', workspace.renderTargetPath);
 
   const projectStore = getProjectStore().getState();
   for (const dir of workspace.emptyFolders) {
     projectStore.addFolder(dir);
   }
-  emitStartupDetail('workspace_open_folders_added', `${workspace.emptyFolders.length} empty folder(s)`);
 
   if (options.trackRecent ?? true) {
     addRecentFolder(dirPath);
-    emitStartupDetail('workspace_open_recent_added', dirPath);
   }
   if (options.requestRender ?? true) {
     requestRender('file_open', { immediate: true });
-    emitStartupDetail('workspace_open_render_requested', workspace.renderTargetPath);
   }
 
   return {

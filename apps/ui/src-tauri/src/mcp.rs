@@ -1,20 +1,31 @@
+use rmcp::{
+    ErrorData as McpError, ServerHandler,
+    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    model::{CallToolResult, Content, ServerCapabilities, ServerInfo, ClientJsonRpcMessage, ServerJsonRpcMessage},
+    schemars, tool, tool_handler, tool_router,
+    transport::streamable_http_server::{
+        StreamableHttpServerConfig, StreamableHttpService,
+        session::{
+            SessionManager, ServerSseMessage, SessionId,
+            local::{LocalSessionManager, LocalSessionManagerError, SessionTransport},
+        },
+    },
+};
+use futures::Stream;
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::Value;
 use std::collections::HashMap;
 use std::fs;
 use std::sync::{mpsc, Arc, Mutex};
-use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager, State, Window};
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 use uuid::Uuid;
 
 use crate::create_new_window_with_launch_intent;
 
-const MCP_PROTOCOL_VERSION: &str = "2025-03-26";
-const MCP_SERVER_NAME: &str = "openscad-studio";
 const MCP_DEFAULT_PORT: u16 = 32123;
-const MCP_SESSION_HEADER: &str = "mcp-session-id";
+
+// ── Public status types ──────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -35,6 +46,8 @@ pub struct McpServerStatus {
     endpoint: Option<String>,
     message: Option<String>,
 }
+
+// ── IPC payloads ─────────────────────────────────────────────────────────────
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -65,6 +78,8 @@ pub struct McpToolResponse {
     pub is_error: bool,
 }
 
+// ── Workspace / session types ─────────────────────────────────────────────────
+
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WorkspaceDescriptor {
@@ -92,10 +107,6 @@ pub enum WindowLaunchIntent {
         request_id: String,
         folder_path: String,
         create_if_empty: bool,
-        /// Pre-read .scad file contents (relative path → content).
-        /// Avoids FS plugin IPC calls from secondary windows.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        files: Option<std::collections::HashMap<String, String>>,
     },
     OpenFile {
         request_id: String,
@@ -180,13 +191,17 @@ fn is_false(value: &bool) -> bool {
     !*value
 }
 
-struct RunningServer {
-    shutdown_tx: mpsc::Sender<()>,
-    join_handle: JoinHandle<()>,
+// ── Running server handle ─────────────────────────────────────────────────────
+
+struct RunningServerHandle {
+    cancellation_token: tokio_util::sync::CancellationToken,
+    join_handle: tokio::task::JoinHandle<()>,
 }
 
+// ── Shared state ──────────────────────────────────────────────────────────────
+
 struct McpStateInner {
-    running_server: Option<RunningServer>,
+    running_server: Option<RunningServerHandle>,
     pending: HashMap<String, mpsc::Sender<McpToolResponse>>,
     window_open_requests: HashMap<String, PendingWindowOpenRequest>,
     status: McpServerStatus,
@@ -222,78 +237,7 @@ impl Default for McpServerState {
     }
 }
 
-/// Read all `.scad` files from a directory tree, returning relative path → content.
-fn read_scad_files(dir: &std::path::Path) -> std::collections::HashMap<String, String> {
-    use std::collections::HashMap;
-    let mut files = HashMap::new();
-
-    fn walk(
-        base: &std::path::Path,
-        current: &std::path::Path,
-        files: &mut HashMap<String, String>,
-    ) {
-        let Ok(entries) = std::fs::read_dir(current) else {
-            return;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            if name_str.starts_with('.') {
-                continue;
-            }
-            if path.is_dir() {
-                walk(base, &path, files);
-            } else if name_str.ends_with(".scad") {
-                if let Ok(content) = std::fs::read_to_string(&path) {
-                    if let Ok(rel) = path.strip_prefix(base) {
-                        files.insert(rel.to_string_lossy().into_owned(), content);
-                    }
-                }
-            }
-        }
-    }
-
-    walk(dir, dir, &mut files);
-    files
-}
-
-pub(crate) fn record_window_startup_phase(
-    state: &McpServerState,
-    window_label: &str,
-    phase: impl Into<String>,
-    detail: Option<String>,
-) {
-    let phase = phase.into();
-    let mut inner = state.inner.lock().unwrap();
-    let workspace = inner
-        .workspaces
-        .entry(window_label.to_string())
-        .or_insert_with(|| RegisteredWorkspace {
-            descriptor: WorkspaceDescriptor {
-                window_id: window_label.to_string(),
-                title: "OpenSCAD Studio".into(),
-                workspace_root: None,
-                render_target_path: None,
-                is_focused: false,
-            },
-            show_welcome: true,
-            mode: RegisteredWindowMode::Welcome,
-            pending_request_id: None,
-            startup_phase: "created".into(),
-            startup_detail: None,
-            context_ready: false,
-            bridge_ready: false,
-            last_focused_order: 0,
-        });
-    workspace.startup_phase = phase;
-    workspace.startup_detail = detail;
-}
-
-struct RpcOutcome {
-    response: Option<Value>,
-    session_id: Option<String>,
-}
+// ── Utility functions ─────────────────────────────────────────────────────────
 
 fn endpoint_for_port(port: u16) -> String {
     format!("http://127.0.0.1:{port}/mcp")
@@ -318,14 +262,6 @@ fn build_status(
     }
 }
 
-fn static_header(name: &'static [u8], value: &'static [u8]) -> Header {
-    Header::from_bytes(name, value).expect("valid static header")
-}
-
-fn dynamic_header(name: &str, value: &str) -> Header {
-    Header::from_bytes(name.as_bytes(), value.as_bytes()).expect("valid dynamic header")
-}
-
 fn text_tool_response(message: impl Into<String>, is_error: bool) -> McpToolResponse {
     McpToolResponse {
         content: vec![McpContentItem::Text {
@@ -333,47 +269,6 @@ fn text_tool_response(message: impl Into<String>, is_error: bool) -> McpToolResp
         }],
         is_error,
     }
-}
-
-fn json_response(
-    status_code: u16,
-    value: &Value,
-    session_id: Option<&str>,
-) -> Response<std::io::Cursor<Vec<u8>>> {
-    let mut response =
-        Response::from_string(value.to_string()).with_status_code(StatusCode(status_code));
-    response.add_header(static_header(b"content-type", b"application/json"));
-    response.add_header(static_header(
-        b"mcp-protocol-version",
-        MCP_PROTOCOL_VERSION.as_bytes(),
-    ));
-    if let Some(session_id) = session_id {
-        response.add_header(dynamic_header(MCP_SESSION_HEADER, session_id));
-    }
-    response
-}
-
-fn empty_response(status_code: u16) -> Response<std::io::Cursor<Vec<u8>>> {
-    Response::from_data(Vec::<u8>::new()).with_status_code(StatusCode(status_code))
-}
-
-fn jsonrpc_result(id: Value, result: Value) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "result": result,
-    })
-}
-
-fn jsonrpc_error(id: Value, code: i64, message: impl Into<String>) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": id,
-        "error": {
-            "code": code,
-            "message": message.into(),
-        }
-    })
 }
 
 fn normalize_workspace_root(path: &str) -> Option<String> {
@@ -484,14 +379,8 @@ fn wait_for_window_tool_ready(
             ));
         }
 
-        thread::sleep(Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
     }
-}
-
-fn ensure_session_id(inner: &mut McpStateInner, existing_session_id: Option<String>) -> String {
-    let session_id = existing_session_id.unwrap_or_else(|| Uuid::new_v4().to_string());
-    inner.sessions.entry(session_id.clone()).or_default();
-    session_id
 }
 
 fn remove_window_and_invalidate_sessions_locked(inner: &mut McpStateInner, window_id: &str) {
@@ -668,10 +557,6 @@ fn dispatch_window_open_request(
         WindowOpenRequest::OpenFile { file_path } => file_path.clone(),
     };
     let (request_id, rx) = create_window_open_request(inner, window_id);
-    eprintln!(
-        "[mcp] dispatch_window_open_request window={} request_id={} target={}",
-        window_id, request_id, target_description
-    );
 
     let payload = WindowOpenRequestPayload {
         request_id: request_id.clone(),
@@ -721,103 +606,6 @@ fn dispatch_window_open_request(
     )
 }
 
-fn tool_definitions() -> Value {
-    json!([
-        {
-            "name": "get_or_create_workspace",
-            "description": "Ensure this MCP session is bound to the exact requested workspace folder by attaching to an already-open match or opening/initializing it in OpenSCAD Studio.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "folder_path": {
-                        "type": "string",
-                        "description": "Absolute folder path to open as the Studio workspace."
-                    }
-                },
-                "required": ["folder_path"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "get_project_context",
-            "description": "Get the current OpenSCAD Studio render target and workspace summary for the selected workspace.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "set_render_target",
-            "description": "Change which workspace-relative file Studio compiles and previews.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "file_path": {
-                        "type": "string",
-                        "description": "Workspace-relative .scad path to use as the render target."
-                    }
-                },
-                "required": ["file_path"],
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "get_diagnostics",
-            "description": "Render the current Studio render target and return the latest diagnostics.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "trigger_render",
-            "description": "Render the current Studio render target and refresh the preview.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {},
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "get_preview_screenshot",
-            "description": "Capture a PNG screenshot of Studio's current preview.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "view": {
-                        "type": "string",
-                        "enum": ["current", "front", "back", "top", "bottom", "left", "right", "isometric"]
-                    },
-                    "azimuth": { "type": "number" },
-                    "elevation": { "type": "number" }
-                },
-                "additionalProperties": false
-            }
-        },
-        {
-            "name": "export_file",
-            "description": "Export the current render target to a file path on desktop.",
-            "inputSchema": {
-                "type": "object",
-                "properties": {
-                    "format": {
-                        "type": "string",
-                        "enum": ["stl", "obj", "amf", "3mf", "svg", "dxf"]
-                    },
-                    "file_path": {
-                        "type": "string",
-                        "description": "Absolute output path, or a project-relative path when a workspace root is open."
-                    }
-                },
-                "required": ["format", "file_path"],
-                "additionalProperties": false
-            }
-        }
-    ])
-}
-
 fn get_or_create_workspace_response(
     app: &AppHandle,
     inner: &Arc<Mutex<McpStateInner>>,
@@ -853,10 +641,6 @@ fn get_or_create_workspace_response(
     };
 
     if let Some(window_id) = existing_window_id {
-        eprintln!(
-            "[mcp] get_or_create_workspace matched existing window={} root={}",
-            window_id, normalized_root
-        );
         let response = {
             let mut locked = inner.lock().unwrap();
             bind_session_to_window(&mut locked, session_id, window_id.clone());
@@ -894,10 +678,6 @@ fn get_or_create_workspace_response(
     };
 
     let (target_window_id, detail) = if let Some(window_id) = target_window_id {
-        eprintln!(
-            "[mcp] get_or_create_workspace reusing blank welcome window={} root={}",
-            window_id, normalized_root
-        );
         match dispatch_window_open_request(
             app,
             inner,
@@ -926,20 +706,13 @@ fn get_or_create_workspace_response(
             Err(message) => return text_tool_response(message, true),
         }
     } else {
-        // Create a new window with the open-folder intent baked into the
-        // initialization script. The window consumes the intent during its
-        // own bootstrap and reports back via report_window_open_result.
         let (request_id, rx) = create_window_open_request(inner, "pending-new-window");
-        // Pre-read .scad files so the secondary window doesn't need FS plugin IPC.
-        let pre_read = read_scad_files(std::path::Path::new(&normalized_root));
-        let files = if pre_read.is_empty() { None } else { Some(pre_read) };
         let window_id = match create_new_window_with_launch_intent(
             app,
             WindowLaunchIntent::OpenFolder {
                 request_id: request_id.clone(),
                 folder_path: normalized_root.clone(),
                 create_if_empty: true,
-                files,
             },
         ) {
             Ok(id) => {
@@ -1002,15 +775,8 @@ fn get_or_create_workspace_response(
 
 fn get_project_context_response(
     inner: &Arc<Mutex<McpStateInner>>,
-    session_id: Option<&str>,
+    session_id: &str,
 ) -> McpToolResponse {
-    let Some(session_id) = session_id else {
-        return text_tool_response(
-            "No OpenSCAD Studio workspace is selected for this MCP session. Call `get_or_create_workspace(folder_path)` first.",
-            true,
-        );
-    };
-
     let mut locked = inner.lock().unwrap();
     let window_id = match require_bound_window_id(&mut locked, session_id) {
         Ok(window_id) => window_id,
@@ -1052,267 +818,348 @@ fn get_project_context_response(
     text_tool_response(parts.join("\n"), false)
 }
 
-fn handle_tool_call(
-    app: &AppHandle,
-    inner: &Arc<Mutex<McpStateInner>>,
-    session_id: Option<String>,
-    params: Value,
-    id: Value,
-) -> Result<RpcOutcome, Value> {
-    let session_id_for_response = session_id.clone();
-    let Some(name) = params.get("name").and_then(Value::as_str) else {
-        return Err(jsonrpc_error(
-            id,
-            -32602,
-            "`tools/call` requires a string `name` parameter.",
-        ));
-    };
+// ── Convert McpToolResponse → rmcp CallToolResult ────────────────────────────
 
-    let arguments = params
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| Value::Object(Default::default()));
+fn mcp_response_to_call_tool_result(response: McpToolResponse) -> CallToolResult {
+    let content: Vec<Content> = response
+        .content
+        .into_iter()
+        .map(|item| match item {
+            McpContentItem::Text { text } => Content::text(text),
+            McpContentItem::Image { data, mime_type } => Content::image(data, mime_type),
+        })
+        .collect();
 
-    let result = match name {
-        "get_or_create_workspace" => match session_id.as_deref() {
-            Some(session_id) => get_or_create_workspace_response(app, inner, session_id, &arguments),
-            None => text_tool_response(
-                "This MCP request does not have a session id yet. Reconnect your MCP client and retry workspace creation.",
-                true,
-            ),
-        },
-        "get_project_context" => get_project_context_response(inner, session_id.as_deref()),
-        _ => {
-            let window_id = {
-                let Some(session_id) = session_id.as_deref() else {
-                    return Ok(RpcOutcome {
-                        response: Some(jsonrpc_result(
-                            id,
-                            serde_json::to_value(text_tool_response(
-                                "No OpenSCAD Studio workspace is selected for this MCP session. Call `get_or_create_workspace(folder_path)` first.",
-                                true,
-                            ))
-                            .expect("serializable MCP tool response"),
-                        )),
-                        session_id: session_id_for_response.clone(),
-                    });
-                };
-
-                let mut inner = inner.lock().unwrap();
-                match require_bound_window_id(&mut inner, session_id) {
-                    Ok(window_id) => window_id,
-                    Err(response) => {
-                        return Ok(RpcOutcome {
-                            response: Some(jsonrpc_result(
-                                id,
-                                serde_json::to_value(response)
-                                    .expect("serializable MCP tool response"),
-                            )),
-                            session_id: session_id_for_response.clone(),
-                        })
-                    }
-                }
-            };
-
-            call_frontend_tool(app, inner, &window_id, name, arguments)
-                .unwrap_or_else(|message| text_tool_response(message, true))
-        }
-    };
-
-    Ok(RpcOutcome {
-        response: Some(jsonrpc_result(
-            id,
-            serde_json::to_value(result).expect("serializable MCP tool response"),
-        )),
-        session_id: session_id_for_response,
-    })
-}
-
-fn handle_rpc_message(
-    app: &AppHandle,
-    inner: &Arc<Mutex<McpStateInner>>,
-    payload: Value,
-    session_id: Option<String>,
-) -> Result<RpcOutcome, Value> {
-    let id = payload.get("id").cloned().unwrap_or(Value::Null);
-    let Some(method) = payload.get("method").and_then(Value::as_str) else {
-        return Err(jsonrpc_error(id, -32600, "Missing JSON-RPC method."));
-    };
-
-    let params = payload.get("params").cloned().unwrap_or_else(|| json!({}));
-
-    match method {
-        "initialize" => {
-            let session_id = {
-                let mut inner = inner.lock().unwrap();
-                ensure_session_id(&mut inner, session_id)
-            };
-
-            Ok(RpcOutcome {
-                response: Some(jsonrpc_result(
-                    id,
-                    json!({
-                        "protocolVersion": MCP_PROTOCOL_VERSION,
-                        "capabilities": {
-                            "tools": {}
-                        },
-                        "serverInfo": {
-                            "name": MCP_SERVER_NAME,
-                            "version": env!("CARGO_PKG_VERSION")
-                        }
-                    }),
-                )),
-                session_id: Some(session_id),
-            })
-        }
-        "notifications/initialized" => Ok(RpcOutcome {
-            response: None,
-            session_id,
-        }),
-        "ping" => Ok(RpcOutcome {
-            response: Some(jsonrpc_result(id, json!({}))),
-            session_id,
-        }),
-        "tools/list" => Ok(RpcOutcome {
-            response: Some(jsonrpc_result(
-                id,
-                json!({
-                    "tools": tool_definitions()
-                }),
-            )),
-            session_id,
-        }),
-        "tools/call" => handle_tool_call(app, inner, session_id, params, id),
-        _ => Err(jsonrpc_error(
-            id,
-            -32601,
-            format!("Method not found: {method}"),
-        )),
+    if response.is_error {
+        CallToolResult::error(content)
+    } else {
+        CallToolResult::success(content)
     }
 }
 
-fn find_request_header(request: &Request, name: &'static str) -> Option<String> {
-    request
-        .headers()
-        .iter()
-        .find(|header| header.field.equiv(name))
-        .map(|header| header.value.as_str().to_string())
+// ── Tool parameter structs ────────────────────────────────────────────────────
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetOrCreateWorkspaceParams {
+    /// Absolute path to the folder to open as a workspace.
+    pub folder_path: String,
 }
 
-fn respond_to_request(mut request: Request, app: &AppHandle, inner: &Arc<Mutex<McpStateInner>>) {
-    if request.url() != "/mcp" {
-        let _ = request.respond(empty_response(404));
-        return;
-    }
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct SetRenderTargetParams {
+    /// Workspace-relative path to the .scad file to use as render target.
+    pub file_path: String,
+}
 
-    if request.method() == &Method::Delete {
-        if let Some(session_id) = find_request_header(&request, MCP_SESSION_HEADER) {
-            inner.lock().unwrap().sessions.remove(&session_id);
-        }
-        let _ = request.respond(empty_response(204));
-        return;
-    }
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct GetPreviewScreenshotParams {
+    /// View perspective: "current", "front", "back", "left", "right", "top", "bottom", or "isometric"
+    #[serde(default)]
+    pub view: Option<String>,
+    /// Camera azimuth angle in degrees
+    #[serde(default)]
+    pub azimuth: Option<f64>,
+    /// Camera elevation angle in degrees
+    #[serde(default)]
+    pub elevation: Option<f64>,
+}
 
-    if request.method() != &Method::Post {
-        let _ = request.respond(empty_response(405));
-        return;
-    }
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ExportFileParams {
+    /// Export format: stl, obj, amf, 3mf, svg, or dxf
+    pub format: String,
+    /// Absolute output path, or workspace-relative path when a workspace root is open
+    pub file_path: String,
+}
 
-    let mut body = String::new();
-    if request.as_reader().read_to_string(&mut body).is_err() {
-        let _ = request.respond(json_response(
-            400,
-            &jsonrpc_error(Value::Null, -32700, "Failed to read request body."),
-            None,
-        ));
-        return;
-    }
+// ── Logging session manager wrapper ───────────────────────────────────────────
 
-    let payload: Value = match serde_json::from_str(&body) {
-        Ok(value) => value,
-        Err(error) => {
-            let _ = request.respond(json_response(
-                400,
-                &jsonrpc_error(
-                    Value::Null,
-                    -32700,
-                    format!("Invalid JSON payload: {error}"),
-                ),
-                None,
-            ));
-            return;
-        }
-    };
+/// Wraps `LocalSessionManager` and logs every `close_session` call so we can
+/// see exactly when and why sessions are being dropped.
+struct LoggingSessionManager {
+    inner: LocalSessionManager,
+}
 
-    if payload.is_array() {
-        let _ = request.respond(json_response(
-            400,
-            &jsonrpc_error(Value::Null, -32600, "Batch requests are not supported."),
-            None,
-        ));
-        return;
-    }
-
-    let session_id = find_request_header(&request, MCP_SESSION_HEADER);
-    match handle_rpc_message(app, inner, payload, session_id) {
-        Ok(outcome) => match outcome.response {
-            Some(response) => {
-                let _ =
-                    request.respond(json_response(200, &response, outcome.session_id.as_deref()));
-            }
-            None => {
-                let _ = request.respond(empty_response(202));
-            }
-        },
-        Err(error) => {
-            let _ = request.respond(json_response(400, &error, None));
-        }
+impl LoggingSessionManager {
+    fn new() -> Self {
+        Self { inner: LocalSessionManager::default() }
     }
 }
 
-fn run_mcp_server(
-    server: Server,
-    shutdown_rx: mpsc::Receiver<()>,
+impl SessionManager for LoggingSessionManager {
+    type Error = LocalSessionManagerError;
+    type Transport = SessionTransport;
+
+    fn create_session(&self) -> impl std::future::Future<Output = Result<(SessionId, Self::Transport), Self::Error>> + Send {
+        self.inner.create_session()
+    }
+
+    fn initialize_session(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> impl std::future::Future<Output = Result<ServerJsonRpcMessage, Self::Error>> + Send {
+        self.inner.initialize_session(id, message)
+    }
+
+    fn has_session(
+        &self,
+        id: &SessionId,
+    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
+        self.inner.has_session(id)
+    }
+
+    fn close_session(
+        &self,
+        id: &SessionId,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        let id_str = id.to_string();
+        eprintln!(
+            "[session-log] close_session called for {id_str} at {:?}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+        );
+        // Capture a backtrace to know who's calling close_session.
+        eprintln!("[session-log] Backtrace:\n{}", std::backtrace::Backtrace::force_capture());
+        self.inner.close_session(id)
+    }
+
+    fn create_stream(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> impl std::future::Future<Output = Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>> + Send {
+        self.inner.create_stream(id, message)
+    }
+
+    fn accept_message(
+        &self,
+        id: &SessionId,
+        message: ClientJsonRpcMessage,
+    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
+        self.inner.accept_message(id, message)
+    }
+
+    fn create_standalone_stream(
+        &self,
+        id: &SessionId,
+    ) -> impl std::future::Future<Output = Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>> + Send {
+        self.inner.create_standalone_stream(id)
+    }
+
+    fn resume(
+        &self,
+        id: &SessionId,
+        last_event_id: String,
+    ) -> impl std::future::Future<Output = Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>> + Send {
+        self.inner.resume(id, last_event_id)
+    }
+}
+
+// ── rmcp handler ──────────────────────────────────────────────────────────────
+
+#[derive(Clone)]
+struct OpenScadMcpHandler {
+    tool_router: ToolRouter<OpenScadMcpHandler>,
     app: AppHandle,
-    inner: Arc<Mutex<McpStateInner>>,
-) {
-    loop {
-        if shutdown_rx.try_recv().is_ok() {
-            break;
-        }
+    shared_state: Arc<Mutex<McpStateInner>>,
+    session_id: String,
+}
 
-        match server.recv_timeout(Duration::from_millis(200)) {
-            Ok(Some(request)) => respond_to_request(request, &app, &inner),
-            Ok(None) => {}
-            Err(error) => {
-                let port = inner.lock().unwrap().status.port;
-                inner.lock().unwrap().status = build_status(
-                    true,
-                    port,
-                    McpServerStateKind::Error,
-                    Some(format!("MCP server stopped unexpectedly: {error}")),
-                );
-                break;
-            }
-        }
+impl Drop for OpenScadMcpHandler {
+    fn drop(&mut self) {
+        eprintln!(
+            "[session-log] OpenScadMcpHandler DROPPED for session {} — serve_inner exited",
+            self.session_id
+        );
+        let mut inner = self.shared_state.lock().unwrap();
+        inner.sessions.remove(&self.session_id);
     }
 }
 
-fn stop_running_server(running_server: Option<RunningServer>) {
-    if let Some(server) = running_server {
-        let _ = server.shutdown_tx.send(());
-        let _ = server.join_handle.join();
+impl OpenScadMcpHandler {
+    fn new(app: AppHandle, shared_state: Arc<Mutex<McpStateInner>>) -> Self {
+        let session_id = Uuid::new_v4().to_string();
+        {
+            let mut inner = shared_state.lock().unwrap();
+            inner.sessions.entry(session_id.clone()).or_default();
+        }
+        Self {
+            tool_router: Self::tool_router(),
+            app,
+            shared_state,
+            session_id,
+        }
     }
+
+    async fn call_frontend(
+        &self,
+        tool_name: &str,
+        arguments: Value,
+    ) -> Result<CallToolResult, McpError> {
+        let window_id = {
+            let mut locked = self.shared_state.lock().unwrap();
+            match require_bound_window_id(&mut locked, &self.session_id) {
+                Ok(id) => id,
+                Err(resp) => return Ok(mcp_response_to_call_tool_result(resp)),
+            }
+        };
+
+        let app = self.app.clone();
+        let state = self.shared_state.clone();
+        let tool = tool_name.to_string();
+
+        let result = tokio::task::spawn_blocking(move || {
+            call_frontend_tool(&app, &state, &window_id, &tool, arguments)
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("{e}"), None))?;
+
+        Ok(mcp_response_to_call_tool_result(
+            result.unwrap_or_else(|e| text_tool_response(e, true)),
+        ))
+    }
+}
+
+#[tool_router]
+impl OpenScadMcpHandler {
+    #[tool(description = "Ensure this MCP session is bound to the exact requested workspace folder by attaching to an already-open match or opening/initializing it in OpenSCAD Studio.")]
+    async fn get_or_create_workspace(
+        &self,
+        Parameters(params): Parameters<GetOrCreateWorkspaceParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = serde_json::json!({ "folder_path": params.folder_path });
+        let app = self.app.clone();
+        let state = self.shared_state.clone();
+        let session_id = self.session_id.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            get_or_create_workspace_response(&app, &state, &session_id, &args)
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("{e}"), None))?;
+
+        Ok(mcp_response_to_call_tool_result(result))
+    }
+
+    #[tool(description = "Get the current OpenSCAD Studio render target and workspace summary for the selected workspace.")]
+    async fn get_project_context(&self) -> Result<CallToolResult, McpError> {
+        let state = self.shared_state.clone();
+        let session_id = self.session_id.clone();
+
+        let result = tokio::task::spawn_blocking(move || {
+            get_project_context_response(&state, &session_id)
+        })
+        .await
+        .map_err(|e| McpError::internal_error(format!("{e}"), None))?;
+
+        Ok(mcp_response_to_call_tool_result(result))
+    }
+
+    #[tool(description = "Change which workspace-relative file Studio compiles and previews.")]
+    async fn set_render_target(
+        &self,
+        Parameters(params): Parameters<SetRenderTargetParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = serde_json::json!({ "file_path": params.file_path });
+        self.call_frontend("set_render_target", args).await
+    }
+
+    #[tool(description = "Render the current Studio render target and return the latest diagnostics.")]
+    async fn get_diagnostics(&self) -> Result<CallToolResult, McpError> {
+        self.call_frontend("get_diagnostics", serde_json::json!({}))
+            .await
+    }
+
+    #[tool(description = "Render the current Studio render target and refresh the preview.")]
+    async fn trigger_render(&self) -> Result<CallToolResult, McpError> {
+        self.call_frontend("trigger_render", serde_json::json!({}))
+            .await
+    }
+
+    #[tool(description = "Capture a PNG screenshot of Studio's current preview.")]
+    async fn get_preview_screenshot(
+        &self,
+        Parameters(params): Parameters<GetPreviewScreenshotParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = serde_json::json!({
+            "view": params.view,
+            "azimuth": params.azimuth,
+            "elevation": params.elevation,
+        });
+        self.call_frontend("get_preview_screenshot", args).await
+    }
+
+    #[tool(description = "Export the current render target to a file path on desktop.")]
+    async fn export_file(
+        &self,
+        Parameters(params): Parameters<ExportFileParams>,
+    ) -> Result<CallToolResult, McpError> {
+        let args = serde_json::json!({
+            "format": params.format,
+            "file_path": params.file_path,
+        });
+        self.call_frontend("export_file", args).await
+    }
+}
+
+#[tool_handler]
+impl ServerHandler for OpenScadMcpHandler {
+    fn get_info(&self) -> ServerInfo {
+        use rmcp::model::Implementation;
+        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+            .with_server_info(Implementation::new(
+                "openscad-studio",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions("OpenSCAD Studio MCP server — controls the OpenSCAD Studio desktop editor.".to_string())
+    }
+}
+
+// ── Tauri commands ────────────────────────────────────────────────────────────
+
+pub(crate) fn record_window_startup_phase(
+    state: &McpServerState,
+    window_label: &str,
+    phase: impl Into<String>,
+    detail: Option<String>,
+) {
+    let phase = phase.into();
+    let mut inner = state.inner.lock().unwrap();
+    let workspace = inner
+        .workspaces
+        .entry(window_label.to_string())
+        .or_insert_with(|| RegisteredWorkspace {
+            descriptor: WorkspaceDescriptor {
+                window_id: window_label.to_string(),
+                title: "OpenSCAD Studio".into(),
+                workspace_root: None,
+                render_target_path: None,
+                is_focused: false,
+            },
+            show_welcome: true,
+            mode: RegisteredWindowMode::Welcome,
+            pending_request_id: None,
+            startup_phase: "created".into(),
+            startup_detail: None,
+            context_ready: false,
+            bridge_ready: false,
+            last_focused_order: 0,
+        });
+    workspace.startup_phase = phase;
+    workspace.startup_detail = detail;
 }
 
 #[tauri::command]
-pub fn configure_mcp_server(
+pub async fn configure_mcp_server(
     app: AppHandle,
     enabled: bool,
     port: u16,
     state: State<'_, McpServerState>,
 ) -> Result<McpServerStatus, String> {
-    let previous_server = {
+    // Take ownership of any existing server handle so we can stop it.
+    let previous = {
         let mut inner = state.inner.lock().unwrap();
         inner.status = build_status(
             enabled,
@@ -1327,7 +1174,11 @@ pub fn configure_mcp_server(
         inner.running_server.take()
     };
 
-    stop_running_server(previous_server);
+    // Stop the previous server if any.
+    if let Some(handle) = previous {
+        handle.cancellation_token.cancel();
+        let _ = handle.join_handle.await;
+    }
 
     if !enabled {
         let mut inner = state.inner.lock().unwrap();
@@ -1337,9 +1188,10 @@ pub fn configure_mcp_server(
         return Ok(inner.status.clone());
     }
 
+    // Try to bind the TCP listener before spawning anything.
     let address = format!("127.0.0.1:{port}");
-    let server = match Server::http(&address) {
-        Ok(server) => server,
+    let tcp_listener = match tokio::net::TcpListener::bind(&address).await {
+        Ok(l) => l,
         Err(error) => {
             let kind = if error
                 .to_string()
@@ -1356,14 +1208,32 @@ pub fn configure_mcp_server(
         }
     };
 
-    let (shutdown_tx, shutdown_rx) = mpsc::channel();
-    let inner = state.inner.clone();
+    let shared_state = state.inner.clone();
     let app_handle = app.clone();
-    let join_handle = thread::spawn(move || run_mcp_server(server, shutdown_rx, app_handle, inner));
+    let ct = tokio_util::sync::CancellationToken::new();
+    let ct_child = ct.child_token();
+
+    let join_handle = tokio::spawn(async move {
+        let service = StreamableHttpService::new(
+            move || {
+                let handler = OpenScadMcpHandler::new(app_handle.clone(), shared_state.clone());
+                Ok(handler)
+            },
+            std::sync::Arc::new(LoggingSessionManager::new()),
+            StreamableHttpServerConfig::default().with_cancellation_token(ct_child.clone()),
+        );
+
+        let router = axum::Router::new().nest_service("/mcp", service);
+        let _ = axum::serve(tcp_listener, router)
+            .with_graceful_shutdown(async move {
+                ct_child.cancelled().await;
+            })
+            .await;
+    });
 
     let mut inner = state.inner.lock().unwrap();
-    inner.running_server = Some(RunningServer {
-        shutdown_tx,
+    inner.running_server = Some(RunningServerHandle {
+        cancellation_token: ct,
         join_handle,
     });
     inner.status = build_status(enabled, port, McpServerStateKind::Running, None);
@@ -1375,233 +1245,24 @@ pub fn get_mcp_server_status(state: State<'_, McpServerState>) -> Result<McpServ
     Ok(state.inner.lock().unwrap().status.clone())
 }
 
-// ── Event-based handlers (used instead of invoke for secondary-window compat) ──
-
-fn parse_event<T: serde::de::DeserializeOwned>(raw: &str) -> Option<T> {
-    serde_json::from_str(raw)
-        .map_err(|e| eprintln!("[mcp] Failed to parse event payload: {e}"))
-        .ok()
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct EventEnvelope<T> {
-    window_label: String,
-    #[serde(flatten)]
-    inner: T,
-}
-
-#[derive(Deserialize)]
-struct EmptyPayload {}
-
-pub fn handle_bridge_ready_event(state: &McpServerState, raw: &str) {
-    let Some(env) = parse_event::<EventEnvelope<EmptyPayload>>(raw) else {
-        return;
-    };
-    let label = env.window_label;
+#[tauri::command]
+pub async fn mcp_mark_window_bridge_ready(
+    window: Window,
+    state: State<'_, McpServerState>,
+) -> Result<(), String> {
+    let label = window.label().to_string();
+    let is_focused = window.is_focused().unwrap_or(false);
     let mut inner = state.inner.lock().unwrap();
-    let workspace = inner
-        .workspaces
-        .entry(label.clone())
-        .or_insert_with(|| RegisteredWorkspace {
-            descriptor: WorkspaceDescriptor {
-                window_id: label.clone(),
-                title: "OpenSCAD Studio".into(),
-                workspace_root: None,
-                render_target_path: None,
-                is_focused: false,
-            },
-            show_welcome: true,
-            mode: RegisteredWindowMode::Welcome,
-            pending_request_id: None,
-            startup_phase: "created".into(),
-            startup_detail: None,
-            context_ready: false,
-            bridge_ready: false,
-            last_focused_order: 0,
-        });
+    let workspace = inner.workspaces.entry(label.clone()).or_insert_with(|| RegisteredWorkspace {
+        descriptor: WorkspaceDescriptor { window_id: label, title: "OpenSCAD Studio".into(), workspace_root: None, render_target_path: None, is_focused },
+        show_welcome: true, mode: RegisteredWindowMode::Welcome, pending_request_id: None,
+        startup_phase: "created".into(), startup_detail: None,
+        context_ready: false, bridge_ready: false, last_focused_order: 0,
+    });
     workspace.bridge_ready = true;
     workspace.startup_phase = "bridge_ready".into();
     workspace.startup_detail = None;
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct ToolResponsePayload {
-    request_id: String,
-    response: McpToolResponse,
-}
-
-pub fn handle_tool_response_event(state: &McpServerState, raw: &str) {
-    let Some(env) = parse_event::<EventEnvelope<ToolResponsePayload>>(raw) else {
-        return;
-    };
-    let sender = state.inner.lock().unwrap().pending.remove(&env.inner.request_id);
-    if let Some(sender) = sender {
-        let _ = sender.send(env.inner.response);
-    }
-}
-
-pub fn handle_window_context_event(state: &McpServerState, raw: &str) {
-    let Some(env) = parse_event::<EventEnvelope<WindowContextPayload>>(raw) else {
-        return;
-    };
-    let label = env.window_label;
-    let payload = env.inner;
-    let normalized_root = payload
-        .workspace_root
-        .as_deref()
-        .and_then(normalize_workspace_root);
-    let title = payload.title.unwrap_or_else(|| "OpenSCAD Studio".into());
-    let render_target_path = payload.render_target_path.clone();
-
-    let mut inner = state.inner.lock().unwrap();
-    let next_focus_order = inner
-        .workspaces
-        .get(&label)
-        .map(|w| w.last_focused_order)
-        .unwrap_or(0);
-    let previous_bridge_ready = inner
-        .workspaces
-        .get(&label)
-        .map(|w| w.bridge_ready)
-        .unwrap_or(false);
-    let previous_startup_phase = inner
-        .workspaces
-        .get(&label)
-        .map(|w| w.startup_phase.clone())
-        .unwrap_or_else(|| "context_updated".into());
-    let previous_startup_detail = inner
-        .workspaces
-        .get(&label)
-        .and_then(|w| w.startup_detail.clone());
-
-    inner.workspaces.insert(
-        label.clone(),
-        RegisteredWorkspace {
-            descriptor: WorkspaceDescriptor {
-                window_id: label,
-                title,
-                workspace_root: normalized_root,
-                render_target_path,
-                is_focused: false,
-            },
-            show_welcome: payload.show_welcome,
-            mode: payload.mode.unwrap_or(if payload.show_welcome {
-                RegisteredWindowMode::Welcome
-            } else {
-                RegisteredWindowMode::Ready
-            }),
-            pending_request_id: payload.pending_request_id,
-            startup_phase: previous_startup_phase,
-            startup_detail: previous_startup_detail,
-            context_ready: payload.ready,
-            bridge_ready: previous_bridge_ready,
-            last_focused_order: next_focus_order,
-        },
-    );
-}
-
-pub fn handle_window_open_result_event(state: &McpServerState, raw: &str) {
-    let Some(env) = parse_event::<EventEnvelope<WindowOpenResultPayload>>(raw) else {
-        return;
-    };
-    let label = env.window_label;
-    let payload = env.inner;
-    let mut inner = state.inner.lock().unwrap();
-
-    inner
-        .workspaces
-        .entry(label.clone())
-        .or_insert_with(|| RegisteredWorkspace {
-            descriptor: WorkspaceDescriptor {
-                window_id: label.clone(),
-                title: "OpenSCAD Studio".into(),
-                workspace_root: None,
-                render_target_path: None,
-                is_focused: false,
-            },
-            show_welcome: true,
-            mode: RegisteredWindowMode::Welcome,
-            pending_request_id: None,
-            startup_phase: "created".into(),
-            startup_detail: None,
-            context_ready: false,
-            bridge_ready: false,
-            last_focused_order: 0,
-        });
-
-    if let Some(pending) = inner.window_open_requests.remove(&payload.request_id) {
-        if let Some(workspace) = inner.workspaces.get_mut(&label) {
-            workspace.pending_request_id = None;
-            workspace.mode = if payload.success {
-                if payload.opened_workspace_root.is_some() {
-                    workspace.show_welcome = false;
-                    RegisteredWindowMode::Ready
-                } else if workspace.show_welcome {
-                    RegisteredWindowMode::Welcome
-                } else {
-                    RegisteredWindowMode::Ready
-                }
-            } else {
-                RegisteredWindowMode::OpenFailed
-            };
-            workspace.startup_phase = if payload.success {
-                "open_request_succeeded".into()
-            } else {
-                "open_request_failed".into()
-            };
-            workspace.startup_detail = payload.message.clone();
-        }
-
-        let result = if payload.success {
-            Ok(WindowOpenResult {
-                message: payload
-                    .message
-                    .unwrap_or_else(|| "Opened target successfully.".into()),
-                opened_workspace_root: payload
-                    .opened_workspace_root
-                    .as_deref()
-                    .and_then(normalize_workspace_root),
-            })
-        } else {
-            Err(payload
-                .message
-                .unwrap_or_else(|| "Failed to open target.".into()))
-        };
-        let _ = pending.sender.send(result);
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StartupPhaseEventPayload {
-    phase: String,
-    detail: Option<String>,
-}
-
-pub fn handle_window_startup_phase_event(state: &McpServerState, raw: &str) {
-    let Some(env) = parse_event::<EventEnvelope<StartupPhaseEventPayload>>(raw) else {
-        return;
-    };
-    record_window_startup_phase(state, &env.window_label, env.inner.phase, env.inner.detail);
-}
-
-// ── Tauri command handlers (invoke-based) ──
-
-#[tauri::command]
-pub async fn mcp_submit_tool_response(
-    request_id: String,
-    response: McpToolResponse,
-    state: State<'_, McpServerState>,
-) -> Result<(), String> {
-    let sender = state.inner.lock().unwrap().pending.remove(&request_id);
-    let Some(sender) = sender else {
-        return Err(format!("No pending MCP tool request found for {request_id}."));
-    };
-    sender
-        .send(response)
-        .map_err(|error| format!("Failed to send MCP tool response: {error}"))
+    Ok(())
 }
 
 #[tauri::command]
@@ -1641,36 +1302,6 @@ pub async fn mcp_update_window_context(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn mcp_mark_window_bridge_ready(
-    window: Window,
-    state: State<'_, McpServerState>,
-) -> Result<(), String> {
-    let label = window.label().to_string();
-    let is_focused = window.is_focused().unwrap_or(false);
-    let mut inner = state.inner.lock().unwrap();
-    let workspace = inner.workspaces.entry(label.clone()).or_insert_with(|| RegisteredWorkspace {
-        descriptor: WorkspaceDescriptor { window_id: label, title: "OpenSCAD Studio".into(), workspace_root: None, render_target_path: None, is_focused },
-        show_welcome: true, mode: RegisteredWindowMode::Welcome, pending_request_id: None,
-        startup_phase: "created".into(), startup_detail: None,
-        context_ready: false, bridge_ready: false, last_focused_order: 0,
-    });
-    workspace.bridge_ready = true;
-    workspace.startup_phase = "bridge_ready".into();
-    workspace.startup_detail = None;
-    Ok(())
-}
-
-#[tauri::command]
-pub async fn mcp_report_window_startup_phase(
-    window: Window,
-    payload: WindowStartupPhasePayload,
-    state: State<'_, McpServerState>,
-) -> Result<(), String> {
-    record_window_startup_phase(&state, window.label(), payload.phase, payload.detail);
-    Ok(())
-}
-
 #[derive(Clone, Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowOpenResultPayload {
@@ -1703,8 +1334,6 @@ pub async fn report_window_open_result(
                 else if workspace.show_welcome { RegisteredWindowMode::Welcome }
                 else { RegisteredWindowMode::Ready }
             } else { RegisteredWindowMode::OpenFailed };
-            workspace.startup_phase = if payload.success { "open_request_succeeded".into() } else { "open_request_failed".into() };
-            workspace.startup_detail = payload.message.clone();
         }
         let result = if payload.success {
             Ok(WindowOpenResult {
@@ -1717,6 +1346,31 @@ pub async fn report_window_open_result(
         let _ = pending.sender.send(result);
     }
     Ok(())
+}
+
+#[tauri::command]
+pub async fn mcp_report_window_startup_phase(
+    window: Window,
+    payload: WindowStartupPhasePayload,
+    state: State<'_, McpServerState>,
+) -> Result<(), String> {
+    record_window_startup_phase(&state, window.label(), payload.phase, payload.detail);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn mcp_submit_tool_response(
+    request_id: String,
+    response: McpToolResponse,
+    state: State<'_, McpServerState>,
+) -> Result<(), String> {
+    let sender = state.inner.lock().unwrap().pending.remove(&request_id);
+    let Some(sender) = sender else {
+        return Err(format!("No pending MCP tool request found for {request_id}."));
+    };
+    sender
+        .send(response)
+        .map_err(|error| format!("Failed to send MCP tool response: {error}"))
 }
 
 pub fn update_window_focus(state: &McpServerState, window_id: &str, is_focused: bool) {
@@ -1737,6 +1391,8 @@ pub fn remove_window(state: &McpServerState, window_id: &str) {
     let mut inner = state.inner.lock().unwrap();
     remove_window_and_invalidate_sessions_locked(&mut inner, window_id);
 }
+
+// ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
@@ -1775,9 +1431,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn ensure_session_id_preserves_existing_id() {
-        let mut inner = McpStateInner {
+    fn make_inner() -> McpStateInner {
+        McpStateInner {
             running_server: None,
             pending: HashMap::new(),
             window_open_requests: HashMap::new(),
@@ -1785,25 +1440,13 @@ mod tests {
             workspaces: HashMap::new(),
             sessions: HashMap::new(),
             next_focus_order: 0,
-        };
-
-        let session_id = ensure_session_id(&mut inner, Some("session-1".into()));
-
-        assert_eq!(session_id, "session-1");
-        assert!(inner.sessions.contains_key("session-1"));
+        }
     }
 
     #[test]
     fn require_bound_window_id_errors_when_unbound() {
-        let mut inner = McpStateInner {
-            running_server: None,
-            pending: HashMap::new(),
-            window_open_requests: HashMap::new(),
-            status: build_status(false, MCP_DEFAULT_PORT, McpServerStateKind::Disabled, None),
-            workspaces: HashMap::new(),
-            sessions: HashMap::from([("session-1".into(), McpSessionBinding::default())]),
-            next_focus_order: 0,
-        };
+        let mut inner = make_inner();
+        inner.sessions.insert("session-1".into(), McpSessionBinding::default());
 
         let response = require_bound_window_id(&mut inner, "session-1").unwrap_err();
         assert!(response.is_error);
@@ -1815,23 +1458,17 @@ mod tests {
 
     #[test]
     fn remove_window_invalidates_bound_sessions() {
-        let mut inner = McpStateInner {
-            running_server: None,
-            pending: HashMap::new(),
-            window_open_requests: HashMap::new(),
-            status: build_status(false, MCP_DEFAULT_PORT, McpServerStateKind::Disabled, None),
-            workspaces: HashMap::from([(
-                "window-a".into(),
-                workspace("window-a", Some("/tmp/project-a"), "Project A", false),
-            )]),
-            sessions: HashMap::from([(
-                "session-1".into(),
-                McpSessionBinding {
-                    bound_window_id: Some("window-a".into()),
-                },
-            )]),
-            next_focus_order: 0,
-        };
+        let mut inner = make_inner();
+        inner.workspaces.insert(
+            "window-a".into(),
+            workspace("window-a", Some("/tmp/project-a"), "Project A", false),
+        );
+        inner.sessions.insert(
+            "session-1".into(),
+            McpSessionBinding {
+                bound_window_id: Some("window-a".into()),
+            },
+        );
 
         remove_window_and_invalidate_sessions_locked(&mut inner, "window-a");
 
@@ -1847,24 +1484,15 @@ mod tests {
 
     #[test]
     fn choose_existing_workspace_for_root_prefers_matching_workspace() {
-        let inner = McpStateInner {
-            running_server: None,
-            pending: HashMap::new(),
-            window_open_requests: HashMap::new(),
-            status: build_status(false, MCP_DEFAULT_PORT, McpServerStateKind::Disabled, None),
-            workspaces: HashMap::from([
-                (
-                    "window-a".into(),
-                    workspace("window-a", Some("/tmp/project-a"), "Project A", false),
-                ),
-                (
-                    "window-b".into(),
-                    workspace("window-b", None, "Welcome", true),
-                ),
-            ]),
-            sessions: HashMap::new(),
-            next_focus_order: 0,
-        };
+        let mut inner = make_inner();
+        inner.workspaces.insert(
+            "window-a".into(),
+            workspace("window-a", Some("/tmp/project-a"), "Project A", false),
+        );
+        inner.workspaces.insert(
+            "window-b".into(),
+            workspace("window-b", None, "Welcome", true),
+        );
 
         assert_eq!(
             choose_existing_workspace_for_root(&inner, "/tmp/project-a"),
@@ -1874,36 +1502,24 @@ mod tests {
 
     #[test]
     fn choose_blank_welcome_window_ignores_non_welcome_windows_without_roots() {
-        let inner = McpStateInner {
-            running_server: None,
-            pending: HashMap::new(),
-            window_open_requests: HashMap::new(),
-            status: build_status(false, MCP_DEFAULT_PORT, McpServerStateKind::Disabled, None),
-            workspaces: HashMap::from([
-                (
-                    "window-a".into(),
-                    workspace("window-a", None, "Unsaved Scratch", false),
-                ),
-                (
-                    "window-b".into(),
-                    workspace("window-b", None, "Welcome", true),
-                ),
-            ]),
-            sessions: HashMap::new(),
-            next_focus_order: 0,
-        };
+        let mut inner = make_inner();
+        inner.workspaces.insert(
+            "window-a".into(),
+            workspace("window-a", None, "Unsaved Scratch", false),
+        );
+        inner.workspaces.insert(
+            "window-b".into(),
+            workspace("window-b", None, "Welcome", true),
+        );
 
         assert_eq!(choose_blank_welcome_window(&inner), Some("window-b".into()));
     }
 
     #[test]
     fn wait_for_window_tool_ready_requires_bridge_listener() {
-        let inner = Arc::new(Mutex::new(McpStateInner {
-            running_server: None,
-            pending: HashMap::new(),
-            window_open_requests: HashMap::new(),
-            status: build_status(false, MCP_DEFAULT_PORT, McpServerStateKind::Disabled, None),
-            workspaces: HashMap::from([(
+        let inner = Arc::new(Mutex::new({
+            let mut s = make_inner();
+            s.workspaces.insert(
                 "main".into(),
                 RegisteredWorkspace {
                     descriptor: WorkspaceDescriptor {
@@ -1922,9 +1538,8 @@ mod tests {
                     bridge_ready: false,
                     last_focused_order: 1,
                 },
-            )]),
-            sessions: HashMap::new(),
-            next_focus_order: 0,
+            );
+            s
         }));
 
         let result = wait_for_window_tool_ready(&inner, "main", Duration::from_millis(0));
@@ -1937,12 +1552,9 @@ mod tests {
 
     #[test]
     fn wait_for_window_tool_ready_succeeds_when_context_and_bridge_are_ready() {
-        let inner = Arc::new(Mutex::new(McpStateInner {
-            running_server: None,
-            pending: HashMap::new(),
-            window_open_requests: HashMap::new(),
-            status: build_status(false, MCP_DEFAULT_PORT, McpServerStateKind::Disabled, None),
-            workspaces: HashMap::from([(
+        let inner = Arc::new(Mutex::new({
+            let mut s = make_inner();
+            s.workspaces.insert(
                 "main".into(),
                 RegisteredWorkspace {
                     descriptor: WorkspaceDescriptor {
@@ -1961,12 +1573,11 @@ mod tests {
                     bridge_ready: true,
                     last_focused_order: 1,
                 },
-            )]),
-            sessions: HashMap::new(),
-            next_focus_order: 0,
+            );
+            s
         }));
 
-        let result = wait_for_window_tool_ready(&inner, "main", Duration::from_millis(0));
+        let result = wait_for_window_tool_ready(&inner, "main", Duration::from_millis(100));
 
         assert!(result.is_ok());
     }

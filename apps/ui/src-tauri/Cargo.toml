@@ -25,4 +25,10 @@ diffy = "0.4"
 uuid = { version = "1", features = ["v4"] }
 chrono = "0.4"
 similar = "2"
-tiny_http = "0.12"
+rmcp = { version = "1", features = ["server", "transport-streamable-http-server"] }
+tokio = { version = "1", features = ["net", "sync", "rt", "rt-multi-thread", "macros"] }
+tokio-util = { version = "0.7" }
+axum = "0.8"
+schemars = "0.8"
+futures = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

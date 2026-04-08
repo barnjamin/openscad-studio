@@ -9,7 +9,6 @@ use mcp::{
     record_window_startup_phase, remove_window, update_window_focus, McpServerState,
     WindowLaunchIntent,
 };
-use tauri::webview::PageLoadEvent;
 use tauri::menu::{MenuBuilder, MenuItemBuilder, SubmenuBuilder};
 use tauri::{Emitter, Manager, WebviewUrl, WebviewWindowBuilder};
 use uuid::Uuid;
@@ -45,27 +44,13 @@ fn build_window_with_label(
     let launch_intent = serde_json::to_string(intent).expect("serializable window launch intent");
     let initialization_script =
         format!("window.__OPENSCAD_STUDIO_BOOTSTRAP__ = {{ launchIntent: {launch_intent} }};");
-    let mcp_state = app.state::<McpServerState>().inner().clone();
+    let mcp_state = app.state::<McpServerState>();
     record_window_startup_phase(&mcp_state, label, "window_created", None);
 
     WebviewWindowBuilder::new(app, label, WebviewUrl::App("index.html".into()))
         .title("OpenSCAD Studio")
         .inner_size(1400.0, 900.0)
         .initialization_script(&initialization_script)
-        .on_page_load(move |window, payload| {
-            let phase = match payload.event() {
-                PageLoadEvent::Started => "page_load_started",
-                PageLoadEvent::Finished => "page_load_finished",
-            };
-            let detail = Some(payload.url().to_string());
-            eprintln!(
-                "[startup:{}] page_load phase={} url={}",
-                window.label(),
-                phase,
-                payload.url()
-            );
-            record_window_startup_phase(&mcp_state, window.label(), phase, detail);
-        })
         .build()?;
     Ok(())
 }
@@ -91,6 +76,15 @@ fn emit_to_focused_window<T: serde::Serialize + Clone>(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Enable rmcp tracing to diagnose session lifecycle issues.
+    // Set RUST_LOG=rmcp=debug,info to see session create/close events.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("rmcp=debug")),
+        )
+        .try_init();
+
     let editor_state = EditorState::default();
     let history_state = HistoryState::new();
     let openscad_state = OpenScadBinaryState::default();

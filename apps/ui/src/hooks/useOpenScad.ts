@@ -10,7 +10,6 @@ import { getPlatform } from '../platform';
 import type { LibrarySettings } from '../stores/settingsStore';
 import { resolveWorkingDirDeps } from '../utils/resolveWorkingDirDeps';
 import { getProjectState, getAuxiliaryFilesForRender } from '../stores/projectStore';
-import { signalAppReady } from '../services/desktopMcp';
 import { notifyError } from '../utils/notifications';
 import { hasRenderableOutput } from './renderOutput';
 export type RenderKind = 'mesh' | 'svg';
@@ -184,7 +183,6 @@ export function useOpenScad(options: UseOpenScadOptions = {}) {
       })
       .then(() => {
         setReady(true);
-        signalAppReady();
       })
       .catch((err) => {
         setError(`Failed to initialize OpenSCAD: ${err}`);

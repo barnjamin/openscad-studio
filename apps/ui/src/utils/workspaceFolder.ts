@@ -17,18 +17,6 @@ type WorkspaceFolderPlatform = Pick<
   'createDirectory' | 'readDirectoryFiles' | 'readSubdirectories' | 'writeTextFile'
 >;
 
-function emitStartupDetail(phase: string, detail?: string) {
-  if (typeof window === 'undefined') return;
-  window.dispatchEvent(
-    new CustomEvent('openscad:startup-phase', {
-      detail: {
-        phase,
-        detail: detail ?? null,
-      },
-    })
-  );
-}
-
 /**
  * Given all subdirectory paths and all file paths in a project,
  * return the directories that have no file descendants (empty folders).
@@ -56,9 +44,7 @@ export async function loadWorkspaceFolder(
   dirPath: string,
   options: WorkspaceFolderLoadOptions = {}
 ): Promise<WorkspaceFolderLoadResult> {
-  emitStartupDetail('workspace_scan_files_begin', dirPath);
   let files = await platform.readDirectoryFiles(dirPath, ['scad'], true);
-  emitStartupDetail('workspace_scan_files_done', `${Object.keys(files).length} file(s)`);
   let filePaths = Object.keys(files);
   let createdDefaultFile = false;
 
@@ -68,32 +54,23 @@ export async function loadWorkspaceFolder(
     }
 
     createdDefaultFile = true;
-    emitStartupDetail('workspace_create_default_begin', dirPath);
     await platform.createDirectory(dirPath);
     await platform.writeTextFile(`${dirPath}/${DEFAULT_TAB_NAME}`, DEFAULT_OPENSCAD_CODE);
     files = { [DEFAULT_TAB_NAME]: DEFAULT_OPENSCAD_CODE };
     filePaths = [DEFAULT_TAB_NAME];
-    emitStartupDetail('workspace_create_default_done', DEFAULT_TAB_NAME);
   }
 
   const renderTargetPath = pickRenderTarget(filePaths);
   if (!renderTargetPath) {
     throw new Error('Could not determine a render target for the workspace');
   }
-  emitStartupDetail('workspace_pick_render_target', renderTargetPath);
 
   let emptyFolders: string[] = [];
   try {
-    emitStartupDetail('workspace_scan_directories_begin', dirPath);
     const allDirs = await platform.readSubdirectories(dirPath);
     emptyFolders = findEmptyFolders(allDirs, filePaths);
-    emitStartupDetail(
-      'workspace_scan_directories_done',
-      `${allDirs.length} dir(s), ${emptyFolders.length} empty`
-    );
   } catch {
     emptyFolders = [];
-    emitStartupDetail('workspace_scan_directories_failed');
   }
 
   return {
