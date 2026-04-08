@@ -1,10 +1,12 @@
 use serde::Serialize;
 use std::collections::HashMap;
 use std::fs;
+use std::hash::{Hash, Hasher};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
+use std::time::UNIX_EPOCH;
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Manager, State};
 
@@ -91,6 +93,20 @@ fn resolve_binary_path(app: &AppHandle) -> Option<PathBuf> {
     None
 }
 
+fn app_bundle_root(binary_path: &Path) -> Option<PathBuf> {
+    binary_path
+        .parent() // MacOS/
+        .and_then(|p| p.parent()) // Contents/
+        .and_then(|p| p.parent()) // OpenSCAD.app/
+        .map(Path::to_path_buf)
+}
+
+fn dev_source_app_bundle() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("binaries")
+        .join("OpenSCAD.app")
+}
+
 /// Strip quarantine and provenance extended attributes from the OpenSCAD app
 /// bundle so macOS doesn't SIGKILL it when spawned as a child process.
 ///
@@ -101,13 +117,8 @@ fn resolve_binary_path(app: &AppHandle) -> Option<PathBuf> {
 /// Invalid) when they are spawned as child processes.
 fn strip_quarantine(binary_path: &Path) {
     // Walk up from .../Contents/MacOS/OpenSCAD to the .app bundle root
-    if let Some(app_bundle) = binary_path
-        .parent() // MacOS/
-        .and_then(|p| p.parent()) // Contents/
-        .and_then(|p| p.parent())
-    // OpenSCAD.app/
-    {
-        let status = Command::new("xattr").arg("-cr").arg(app_bundle).status();
+    if let Some(app_bundle) = app_bundle_root(binary_path) {
+        let status = Command::new("xattr").arg("-cr").arg(&app_bundle).status();
         match status {
             Ok(s) if s.success() => {
                 eprintln!(
@@ -130,6 +141,79 @@ fn strip_quarantine(binary_path: &Path) {
             }
         }
     }
+}
+
+/// Prepare a binary path that is safe to execute on macOS without mutating the
+/// watched source tree during `tauri dev`.
+fn prepare_binary_for_execution(binary_path: &Path) -> Result<PathBuf, String> {
+    let Some(app_bundle) = app_bundle_root(binary_path) else {
+        return Ok(binary_path.to_path_buf());
+    };
+
+    let dev_app_bundle = dev_source_app_bundle();
+    if app_bundle != dev_app_bundle {
+        strip_quarantine(binary_path);
+        return Ok(binary_path.to_path_buf());
+    }
+
+    let modified_secs = fs::metadata(&app_bundle)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0);
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    app_bundle.hash(&mut hasher);
+    let path_hash = hasher.finish();
+
+    let cached_bundle = std::env::temp_dir()
+        .join("openscad-studio")
+        .join("dev-openscad-cache")
+        .join(format!("{path_hash:016x}-{modified_secs}"))
+        .join("OpenSCAD.app");
+    let cached_binary = cached_bundle
+        .join("Contents")
+        .join("MacOS")
+        .join("OpenSCAD");
+
+    if !cached_binary.exists() {
+        if let Some(parent) = cached_bundle.parent() {
+            fs::create_dir_all(parent)
+                .map_err(|e| format!("Failed to create cached OpenSCAD directory: {e}"))?;
+        }
+
+        if cached_bundle.exists() {
+            fs::remove_dir_all(&cached_bundle)
+                .map_err(|e| format!("Failed to replace cached OpenSCAD copy: {e}"))?;
+        }
+
+        let status = Command::new("ditto")
+            .arg(&app_bundle)
+            .arg(&cached_bundle)
+            .status()
+            .map_err(|e| format!("Failed to copy OpenSCAD.app into cache: {e}"))?;
+
+        if !status.success() {
+            return Err(format!(
+                "Failed to copy OpenSCAD.app into cache (exit code {})",
+                status.code().unwrap_or(-1)
+            ));
+        }
+
+        eprintln!(
+            "[render] Cached dev OpenSCAD outside watched tree at {:?}",
+            cached_bundle
+        );
+    } else {
+        eprintln!(
+            "[render] Reusing cached dev OpenSCAD outside watched tree at {:?}",
+            cached_bundle
+        );
+    }
+
+    strip_quarantine(&cached_binary);
+    Ok(cached_binary)
 }
 
 /// Get the OpenSCAD version string from the binary.
@@ -325,10 +409,7 @@ pub async fn render_init(
 ) -> Result<String, String> {
     let binary_path =
         resolve_binary_path(&app).ok_or("OpenSCAD binary not found. Install OpenSCAD or place the binary in the app's binaries/ directory.")?;
-
-    // Strip quarantine/provenance attributes before first use. On macOS 26+,
-    // these attributes cause SIGKILL when spawning nested app bundles.
-    strip_quarantine(&binary_path);
+    let binary_path = prepare_binary_for_execution(&binary_path)?;
 
     let version = get_binary_version(&binary_path).unwrap_or_else(|| "unknown".to_string());
     eprintln!(
