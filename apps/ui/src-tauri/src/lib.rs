@@ -76,15 +76,6 @@ fn emit_to_focused_window<T: serde::Serialize + Clone>(
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    // Enable rmcp tracing to diagnose session lifecycle issues.
-    // Set RUST_LOG=rmcp=debug,info to see session create/close events.
-    let _ = tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("rmcp=debug")),
-        )
-        .try_init();
-
     let editor_state = EditorState::default();
     let history_state = HistoryState::new();
     let openscad_state = OpenScadBinaryState::default();
