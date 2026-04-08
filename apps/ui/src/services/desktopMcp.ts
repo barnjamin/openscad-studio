@@ -228,9 +228,24 @@ function resolveNextRenderWaiter(snapshot: RenderSnapshotLike) {
   waiter.resolve(snapshot);
 }
 
-async function runRenderAndWait(trigger: RenderTrigger): Promise<RenderSnapshotLike> {
+/**
+ * Read the render target file fresh from disk, bypassing the file-watcher
+ * debounce. Used before MCP-triggered renders so that external edits (e.g.
+ * from Claude Code) are reflected immediately rather than after the 300ms
+ * debounce window.
+ */
+async function readRenderTargetFromDisk(): Promise<string | null> {
+  const state = getProjectState();
+  if (!state.renderTargetPath || !state.projectRoot) return null;
+  const { join } = await import('@tauri-apps/api/path');
+  const absolutePath = await join(state.projectRoot, state.renderTargetPath);
+  const result = await getPlatform().fileRead(absolutePath);
+  return result?.content ?? null;
+}
+
+async function runRenderAndWait(trigger: RenderTrigger, code?: string): Promise<RenderSnapshotLike> {
   const pending = waitForNextRender();
-  requestRender(trigger, { immediate: true });
+  requestRender(trigger, { immediate: true, code });
   return pending;
 }
 
@@ -291,12 +306,14 @@ async function handleSetRenderTarget(
 }
 
 async function handleDiagnostics(): Promise<McpToolResponse> {
-  const snapshot = await runRenderAndWait('manual');
+  const freshCode = await readRenderTargetFromDisk().catch(() => null);
+  const snapshot = await runRenderAndWait('manual', freshCode ?? undefined);
   return textResponse(formatDiagnostics(snapshot.diagnostics, snapshot.error));
 }
 
 async function handleTriggerRender(): Promise<McpToolResponse> {
-  const snapshot = await runRenderAndWait('manual');
+  const freshCode = await readRenderTargetFromDisk().catch(() => null);
+  const snapshot = await runRenderAndWait('manual', freshCode ?? undefined);
   return textResponse(
     `✅ Render completed for ${getProjectState().renderTargetPath ?? 'the current render target'}.\n\n${formatDiagnostics(
       snapshot.diagnostics,
