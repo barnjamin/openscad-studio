@@ -84,7 +84,6 @@ import type { WorkspaceTab as WorkspaceDocumentTab } from './stores/workspaceTyp
 import {
   OPENSCAD_PROJECT_FILE_EXTENSIONS,
   isOpenScadProjectFilePath,
-  isRenderableOpenScadFilePath,
   pickOpenScadRenderTarget,
 } from '../../../packages/shared/src/openscadProjectFiles';
 
