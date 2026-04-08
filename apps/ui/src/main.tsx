@@ -423,7 +423,9 @@ function BootstrapApp() {
             };
             setWindowState(readyState);
             reportStartupPhase('open_request_succeeded', result.workspaceRoot);
-            void syncWindowContext(readyState, {
+            // Sync context before reporting open result so context_ready is set
+            // in Rust before the MCP server unblocks get_or_create_workspace.
+            await syncWindowContext(readyState, {
               workspaceRoot: result.workspaceRoot,
               renderTargetPath: result.renderTargetPath,
             });
@@ -452,7 +454,7 @@ function BootstrapApp() {
           };
           setWindowState(readyState);
           reportStartupPhase('open_request_succeeded', request.file_path);
-          void syncWindowContext(readyState, {
+          await syncWindowContext(readyState, {
             workspaceRoot: result.projectRoot,
             renderTargetPath: result.projectPath,
           });

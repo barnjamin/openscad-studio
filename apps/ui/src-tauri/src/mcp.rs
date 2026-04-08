@@ -1,17 +1,13 @@
 use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
-    model::{CallToolResult, Content, ServerCapabilities, ServerInfo, ClientJsonRpcMessage, ServerJsonRpcMessage},
+    model::{CallToolResult, Content, ServerCapabilities, ServerInfo},
     schemars, tool, tool_handler, tool_router,
     transport::streamable_http_server::{
         StreamableHttpServerConfig, StreamableHttpService,
-        session::{
-            SessionManager, ServerSseMessage, SessionId,
-            local::{LocalSessionManager, LocalSessionManagerError, SessionTransport},
-        },
+        session::local::LocalSessionManager,
     },
 };
-use futures::Stream;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::HashMap;
@@ -872,91 +868,6 @@ pub struct ExportFileParams {
     pub file_path: String,
 }
 
-// ── Logging session manager wrapper ───────────────────────────────────────────
-
-/// Wraps `LocalSessionManager` and logs every `close_session` call so we can
-/// see exactly when and why sessions are being dropped.
-struct LoggingSessionManager {
-    inner: LocalSessionManager,
-}
-
-impl LoggingSessionManager {
-    fn new() -> Self {
-        Self { inner: LocalSessionManager::default() }
-    }
-}
-
-impl SessionManager for LoggingSessionManager {
-    type Error = LocalSessionManagerError;
-    type Transport = SessionTransport;
-
-    fn create_session(&self) -> impl std::future::Future<Output = Result<(SessionId, Self::Transport), Self::Error>> + Send {
-        self.inner.create_session()
-    }
-
-    fn initialize_session(
-        &self,
-        id: &SessionId,
-        message: ClientJsonRpcMessage,
-    ) -> impl std::future::Future<Output = Result<ServerJsonRpcMessage, Self::Error>> + Send {
-        self.inner.initialize_session(id, message)
-    }
-
-    fn has_session(
-        &self,
-        id: &SessionId,
-    ) -> impl std::future::Future<Output = Result<bool, Self::Error>> + Send {
-        self.inner.has_session(id)
-    }
-
-    fn close_session(
-        &self,
-        id: &SessionId,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        let id_str = id.to_string();
-        eprintln!(
-            "[session-log] close_session called for {id_str} at {:?}",
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-        );
-        // Capture a backtrace to know who's calling close_session.
-        eprintln!("[session-log] Backtrace:\n{}", std::backtrace::Backtrace::force_capture());
-        self.inner.close_session(id)
-    }
-
-    fn create_stream(
-        &self,
-        id: &SessionId,
-        message: ClientJsonRpcMessage,
-    ) -> impl std::future::Future<Output = Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>> + Send {
-        self.inner.create_stream(id, message)
-    }
-
-    fn accept_message(
-        &self,
-        id: &SessionId,
-        message: ClientJsonRpcMessage,
-    ) -> impl std::future::Future<Output = Result<(), Self::Error>> + Send {
-        self.inner.accept_message(id, message)
-    }
-
-    fn create_standalone_stream(
-        &self,
-        id: &SessionId,
-    ) -> impl std::future::Future<Output = Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>> + Send {
-        self.inner.create_standalone_stream(id)
-    }
-
-    fn resume(
-        &self,
-        id: &SessionId,
-        last_event_id: String,
-    ) -> impl std::future::Future<Output = Result<impl Stream<Item = ServerSseMessage> + Send + Sync + 'static, Self::Error>> + Send {
-        self.inner.resume(id, last_event_id)
-    }
-}
-
 // ── rmcp handler ──────────────────────────────────────────────────────────────
 
 #[derive(Clone)]
@@ -969,10 +880,6 @@ struct OpenScadMcpHandler {
 
 impl Drop for OpenScadMcpHandler {
     fn drop(&mut self) {
-        eprintln!(
-            "[session-log] OpenScadMcpHandler DROPPED for session {} — serve_inner exited",
-            self.session_id
-        );
         let mut inner = self.shared_state.lock().unwrap();
         inner.sessions.remove(&self.session_id);
     }
@@ -1158,6 +1065,19 @@ pub async fn configure_mcp_server(
     port: u16,
     state: State<'_, McpServerState>,
 ) -> Result<McpServerStatus, String> {
+    // Idempotency check: every window calls this on mount, but we must not
+    // restart the server just because a secondary window opened. If the server
+    // is already running with the same config, return early.
+    {
+        let inner = state.inner.lock().unwrap();
+        if enabled && inner.running_server.is_some() && inner.status.port == port {
+            return Ok(inner.status.clone());
+        }
+        if !enabled && inner.running_server.is_none() {
+            return Ok(inner.status.clone());
+        }
+    }
+
     // Take ownership of any existing server handle so we can stop it.
     let previous = {
         let mut inner = state.inner.lock().unwrap();
@@ -1219,7 +1139,7 @@ pub async fn configure_mcp_server(
                 let handler = OpenScadMcpHandler::new(app_handle.clone(), shared_state.clone());
                 Ok(handler)
             },
-            std::sync::Arc::new(LoggingSessionManager::new()),
+            std::sync::Arc::new(LocalSessionManager::default()),
             StreamableHttpServerConfig::default().with_cancellation_token(ct_child.clone()),
         );
 
