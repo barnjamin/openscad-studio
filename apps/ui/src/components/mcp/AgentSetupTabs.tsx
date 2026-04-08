@@ -1,5 +1,5 @@
 import { useCallback, useMemo, useState } from 'react';
-import { TbBraces, TbCopy, TbTerminal2 } from 'react-icons/tb';
+import { TbCopy } from 'react-icons/tb';
 import { Button, IconButton, Tabs, TabsContent, TabsList, TabsTrigger, Text } from '../ui';
 import {
   buildClaudeMcpCommand,
@@ -24,6 +24,7 @@ interface AgentSetupItem {
 interface AgentSetupTabsProps {
   port: number;
   surface?: 'panel' | 'settings';
+  layout?: 'stacked' | 'split';
 }
 
 function SetupCodeBlock({
@@ -43,16 +44,15 @@ function SetupCodeBlock({
     <div
       className="overflow-hidden rounded-xl border"
       style={{
-        backgroundColor: 'color-mix(in srgb, var(--bg-tertiary) 78%, var(--bg-primary))',
-        borderColor: 'var(--border-primary)',
-        boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.03)',
+        backgroundColor: 'var(--bg-tertiary)',
+        borderColor: 'var(--border-secondary)',
       }}
     >
       <div
-        className={`flex items-center justify-between ${compact ? 'px-3 py-2' : 'px-4 py-3'}`}
+        className={`flex items-center justify-between ${compact ? 'px-3 py-1.5' : 'px-3 py-2'}`}
         style={{
-          borderBottom: '1px solid var(--border-primary)',
-          backgroundColor: 'color-mix(in srgb, var(--bg-secondary) 92%, var(--bg-primary))',
+          borderBottom: '1px solid var(--border-secondary)',
+          backgroundColor: 'var(--bg-primary)',
         }}
       >
         <div className="flex min-w-0 items-center gap-2">
@@ -62,7 +62,7 @@ function SetupCodeBlock({
             weight="semibold"
             className="rounded-full px-2 py-0.5"
             style={{
-              backgroundColor: 'color-mix(in srgb, var(--accent-primary) 14%, transparent)',
+              backgroundColor: 'var(--bg-tertiary)',
               color: 'var(--text-primary)',
             }}
           >
@@ -112,8 +112,13 @@ function SetupCodeBlock({
   );
 }
 
-export function AgentSetupTabs({ port, surface = 'settings' }: AgentSetupTabsProps) {
+export function AgentSetupTabs({
+  port,
+  surface = 'settings',
+  layout = 'stacked',
+}: AgentSetupTabsProps) {
   const compact = surface === 'panel';
+  const isSplit = layout === 'split';
   const [selectedAgent, setSelectedAgent] = useState<AgentSetupId>('claude');
   const commands = useMemo<AgentSetupItem[]>(
     () => [
@@ -122,8 +127,7 @@ export function AgentSetupTabs({ port, surface = 'settings' }: AgentSetupTabsPro
         label: 'Claude Code',
         command: buildClaudeMcpCommand(port),
         codeLabel: 'Shell',
-        instruction:
-          'Run this command in your terminal to register OpenSCAD Studio as an MCP server, then call get_or_create_workspace with your repo root before using render tools.',
+        instruction: 'Run this command in your terminal to register OpenSCAD Studio as an MCP server.',
       },
       {
         id: 'cursor',
@@ -131,17 +135,14 @@ export function AgentSetupTabs({ port, surface = 'settings' }: AgentSetupTabsPro
         command: buildCursorMcpConfig(port),
         codeLabel: 'JSON',
         locationLabel: '~/.cursor/mcp.json',
-        instruction:
-          'Open Cursor MCP settings and add the OpenSCAD Studio server, then call get_or_create_workspace with your repo root before using render tools.',
-        instructionDetail: 'You can also edit your mcp.json directly.',
+        instruction: 'Add this config in Cursor MCP settings or in ~/.cursor/mcp.json.',
       },
       {
         id: 'codex',
         label: 'Codex',
         command: buildCodexMcpCommand(port),
         codeLabel: 'Shell',
-        instruction:
-          'Run this command in your terminal to add the OpenSCAD Studio MCP endpoint, then call get_or_create_workspace with your repo root before using render tools.',
+        instruction: 'Run this command in your terminal to add the OpenSCAD Studio MCP endpoint.',
       },
       {
         id: 'opencode',
@@ -149,9 +150,7 @@ export function AgentSetupTabs({ port, surface = 'settings' }: AgentSetupTabsPro
         command: buildOpenCodeMcpConfig(port),
         codeLabel: 'JSON',
         locationLabel: '~/.config/opencode/opencode.json',
-        instruction:
-          'Open OpenCode MCP settings and add the OpenSCAD Studio server, then call get_or_create_workspace with your repo root before using render tools.',
-        instructionDetail: 'You can also edit the config file directly.',
+        instruction: 'Add this config in OpenCode MCP settings or in ~/.config/opencode/opencode.json.',
       },
     ],
     [port]
@@ -176,57 +175,53 @@ export function AgentSetupTabs({ port, surface = 'settings' }: AgentSetupTabsPro
     <Tabs
       value={selectedAgent}
       onValueChange={(value) => setSelectedAgent(value as AgentSetupId)}
-      orientation="horizontal"
-      className="flex flex-col gap-3"
+      orientation={isSplit ? 'vertical' : 'horizontal'}
+      className={
+        isSplit
+          ? 'grid grid-cols-[10rem_minmax(0,1fr)] items-stretch overflow-hidden rounded-xl border'
+          : 'overflow-hidden rounded-xl border'
+      }
+      style={{
+        backgroundColor: 'var(--bg-secondary)',
+        borderColor: 'var(--border-secondary)',
+      }}
     >
       <div
-        className="overflow-x-auto rounded-xl border p-1"
-        style={{
-          backgroundColor: 'color-mix(in srgb, var(--bg-secondary) 92%, var(--bg-primary))',
-          borderColor: 'var(--border-primary)',
-        }}
+        className={isSplit ? 'min-w-0 px-3 py-3' : 'overflow-x-auto px-2 py-2'}
+        style={
+          isSplit
+            ? { borderRight: '1px solid var(--border-secondary)' }
+            : {
+                borderBottom: '1px solid var(--border-secondary)',
+                backgroundColor: 'var(--bg-primary)',
+              }
+        }
       >
         <TabsList
           aria-label="Desktop agent setup"
-          className="inline-flex min-w-full items-stretch gap-1"
+          className={
+            isSplit
+              ? 'flex flex-col items-stretch gap-1'
+              : 'inline-flex min-w-full items-stretch gap-1'
+          }
         >
           {commands.map((item) => {
             const isActive = selectedAgent === item.id;
-            const formatIcon =
-              item.codeLabel === 'JSON' ? <TbBraces size={14} /> : <TbTerminal2 size={14} />;
             return (
               <TabsTrigger
                 key={item.id}
                 value={item.id}
-                className="group inline-flex min-w-[8.5rem] flex-1 items-center justify-between rounded-lg px-3 py-2 text-left outline-none transition-colors"
+                className={
+                  isSplit
+                    ? 'inline-flex w-full items-center justify-start whitespace-nowrap rounded-md px-2.5 py-2 text-left text-xs font-medium outline-none transition-colors'
+                    : 'inline-flex min-w-[5.5rem] flex-1 items-center justify-center whitespace-nowrap rounded-md px-2 py-1 text-center text-xs font-medium outline-none transition-colors'
+                }
                 style={{
-                  backgroundColor: isActive
-                    ? 'color-mix(in srgb, var(--accent-primary) 14%, var(--bg-tertiary))'
-                    : 'transparent',
+                  backgroundColor: isActive ? 'var(--bg-tertiary)' : 'transparent',
                   color: isActive ? 'var(--text-primary)' : 'var(--text-secondary)',
-                  boxShadow: isActive ? 'inset 0 1px 0 rgba(255,255,255,0.04)' : undefined,
                 }}
               >
-                <span className="flex min-w-0 flex-col">
-                  <span className="text-sm font-medium leading-5">{item.label}</span>
-                  <span
-                    className="text-[11px] leading-4"
-                    style={{ color: isActive ? 'var(--text-secondary)' : 'var(--text-tertiary)' }}
-                  >
-                    {item.codeLabel}
-                  </span>
-                </span>
-                <span
-                  className="ml-3 shrink-0 rounded-full p-1"
-                  style={{
-                    backgroundColor: isActive
-                      ? 'color-mix(in srgb, var(--accent-primary) 16%, transparent)'
-                      : 'color-mix(in srgb, var(--bg-tertiary) 72%, transparent)',
-                    color: isActive ? 'var(--text-primary)' : 'var(--text-tertiary)',
-                  }}
-                >
-                  {formatIcon}
-                </span>
+                {item.label}
               </TabsTrigger>
             );
           })}
@@ -234,59 +229,27 @@ export function AgentSetupTabs({ port, surface = 'settings' }: AgentSetupTabsPro
       </div>
 
       {commands.map((item) => (
-        <TabsContent
-          key={item.id}
-          value={item.id}
-          className="outline-none"
-        >
+        <TabsContent key={item.id} value={item.id} className="outline-none">
           <div
-            className="rounded-xl border"
-            style={{
-              background:
-                'linear-gradient(180deg, color-mix(in srgb, var(--bg-secondary) 97%, var(--bg-primary)) 0%, color-mix(in srgb, var(--bg-tertiary) 90%, var(--bg-primary)) 100%)',
-              borderColor: 'var(--border-primary)',
-              boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.03)',
-            }}
+            className={`${isSplit ? 'min-w-0 px-3 py-3' : compact ? 'px-3 py-3' : 'px-4 py-4'} flex flex-col`}
+            style={{ gap: 'var(--space-3)' }}
           >
-            <div
-              className={`${compact ? 'px-3 py-3' : 'px-4 py-4'} flex flex-col`}
-              style={{ gap: 'var(--space-helper-gap)' }}
-            >
-              <div className="flex items-center justify-between gap-3">
-                <div className="min-w-0">
-                  <Text variant="caption" weight="semibold" color="primary">
-                    {item.label}
-                  </Text>
-                  {item.locationLabel ? (
-                    <Text
-                      variant="caption"
-                      color="tertiary"
-                      className="mt-1 block"
-                      style={{ wordBreak: 'break-word' }}
-                    >
-                      {item.locationLabel}
-                    </Text>
-                  ) : null}
-                </div>
-              </div>
-
-              <div className="space-y-2">
-                <Text variant="caption">{item.instruction}</Text>
-                {item.instructionDetail ? (
-                  <Text variant="caption" color="tertiary">
-                    {item.instructionDetail}
-                  </Text>
-                ) : null}
-              </div>
-
-              <SetupCodeBlock
-                label={item.codeLabel}
-                locationLabel={item.locationLabel}
-                value={item.command}
-                compact={compact}
-                onCopy={() => void copyText(`${item.label} MCP setup`, item.command)}
-              />
+            <div className="space-y-2">
+              <Text variant="caption">{item.instruction}</Text>
+              {item.instructionDetail ? (
+                <Text variant="caption" color="tertiary">
+                  {item.instructionDetail}
+                </Text>
+              ) : null}
             </div>
+
+            <SetupCodeBlock
+              label={item.codeLabel}
+              locationLabel={item.locationLabel}
+              value={item.command}
+              compact={compact}
+              onCopy={() => void copyText(`${item.label} MCP setup`, item.command)}
+            />
           </div>
         </TabsContent>
       ))}

@@ -1,4 +1,4 @@
-import { useRef, useEffect, forwardRef, useImperativeHandle } from 'react';
+import { useRef, useEffect, useState, forwardRef, useImperativeHandle } from 'react';
 import { ChatImage, ChatImageGrid } from './ChatImage';
 import { Button } from './ui';
 import { MarkdownMessage } from './MarkdownMessage';
@@ -163,6 +163,10 @@ export const AiPromptPanel = forwardRef<AiPromptPanelRef, AiPromptPanelProps>(
     const hasApiKey = useHasApiKey();
     const responseRef = useRef<HTMLDivElement>(null);
     const composerRef = useRef<AiComposerRef>(null);
+    const emptyStateHostRef = useRef<HTMLDivElement>(null);
+    const [emptyStatePanelLayout, setEmptyStatePanelLayout] = useState<'stacked' | 'split'>(
+      'stacked'
+    );
     const { restoreToCheckpoint } = useHistory();
 
     useImperativeHandle(ref, () => ({
@@ -190,6 +194,32 @@ export const AiPromptPanel = forwardRef<AiPromptPanelRef, AiPromptPanelProps>(
       });
       // Only fire once per panel mount.
       // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
+
+    useEffect(() => {
+      if (typeof ResizeObserver === 'undefined') {
+        setEmptyStatePanelLayout('stacked');
+        return;
+      }
+
+      const node = emptyStateHostRef.current;
+      if (!node) return;
+
+      const updateLayout = (width: number, height: number) => {
+        setEmptyStatePanelLayout(width >= 760 && width / Math.max(height, 1) >= 1.45 ? 'split' : 'stacked');
+      };
+
+      const rect = node.getBoundingClientRect();
+      updateLayout(rect.width, rect.height);
+
+      const observer = new ResizeObserver((entries) => {
+        const entry = entries[0];
+        if (!entry) return;
+        updateLayout(entry.contentRect.width, entry.contentRect.height);
+      });
+
+      observer.observe(node);
+      return () => observer.disconnect();
     }, []);
 
     const handleRestoreCheckpoint = async (checkpointId: string, messageId: string) => {
@@ -239,11 +269,16 @@ export const AiPromptPanel = forwardRef<AiPromptPanelRef, AiPromptPanelProps>(
       const isDesktop = getPlatform().capabilities.hasFileSystem;
       return (
         <div
-          className="h-full flex items-center justify-center px-6"
+          ref={emptyStateHostRef}
+          className="h-full overflow-y-auto flex items-start justify-center px-6 py-6"
           style={{ backgroundColor: 'var(--bg-primary)' }}
         >
           {isDesktop ? (
-            <AiAccessEmptyState onOpenSettings={onOpenSettings} variant="panel" />
+            <AiAccessEmptyState
+              onOpenSettings={onOpenSettings}
+              variant="panel"
+              panelLayout={emptyStatePanelLayout}
+            />
           ) : (
             <div className="text-center max-w-xs">
               <div className="text-sm mb-3" style={{ color: 'var(--text-secondary)' }}>
