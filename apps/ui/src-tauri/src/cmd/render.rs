@@ -41,10 +41,26 @@ impl Default for OpenScadBinaryState {
 
 /// Resolve the path to the OpenSCAD binary.
 /// Tries (in order):
-/// 1. Bundled OpenSCAD.app resource (Tauri resource bundling)
-/// 2. Dev-mode OpenSCAD.app in src-tauri/binaries/
+/// 1. Dev-mode OpenSCAD.app in src-tauri/binaries/ (preferred in dev to avoid
+///    macOS provenance attributes that Tauri's resource copy adds)
+/// 2. Bundled OpenSCAD.app resource (Tauri resource bundling — production)
 /// 3. System-installed binary via PATH
 fn resolve_binary_path(app: &AppHandle) -> Option<PathBuf> {
+    // Dev mode: look in src-tauri/binaries/OpenSCAD.app first.
+    // Tauri copies resources to target/debug/ which adds com.apple.provenance
+    // attributes, causing macOS to SIGKILL the binary. The source in binaries/
+    // has been cleaned by the download script and is safe to run.
+    let dev_app = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("binaries")
+        .join("OpenSCAD.app")
+        .join("Contents")
+        .join("MacOS")
+        .join("OpenSCAD");
+    if dev_app.exists() {
+        eprintln!("[render] Found dev OpenSCAD at {:?}", dev_app);
+        return Some(dev_app);
+    }
+
     // Production: bundled as a Tauri resource at OpenSCAD.app/Contents/MacOS/OpenSCAD
     if let Ok(resource_dir) = app.path().resource_dir() {
         let bundled = resource_dir
@@ -56,18 +72,6 @@ fn resolve_binary_path(app: &AppHandle) -> Option<PathBuf> {
             eprintln!("[render] Found bundled OpenSCAD at {:?}", bundled);
             return Some(bundled);
         }
-    }
-
-    // Dev mode: look in src-tauri/binaries/OpenSCAD.app
-    let dev_app = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("binaries")
-        .join("OpenSCAD.app")
-        .join("Contents")
-        .join("MacOS")
-        .join("OpenSCAD");
-    if dev_app.exists() {
-        eprintln!("[render] Found dev OpenSCAD at {:?}", dev_app);
-        return Some(dev_app);
     }
 
     // Fallback: system-installed OpenSCAD via PATH
@@ -85,6 +89,47 @@ fn resolve_binary_path(app: &AppHandle) -> Option<PathBuf> {
     }
 
     None
+}
+
+/// Strip quarantine and provenance extended attributes from the OpenSCAD app
+/// bundle so macOS doesn't SIGKILL it when spawned as a child process.
+///
+/// On macOS 26+, files downloaded from the internet carry `com.apple.quarantine`
+/// and `com.apple.provenance` attributes. Even when the outer app is notarized,
+/// nested app bundles (like our bundled OpenSCAD.app) retain these attributes.
+/// macOS Code Signing Monitor kills such binaries with SIGKILL (Code Signature
+/// Invalid) when they are spawned as child processes.
+fn strip_quarantine(binary_path: &Path) {
+    // Walk up from .../Contents/MacOS/OpenSCAD to the .app bundle root
+    if let Some(app_bundle) = binary_path
+        .parent() // MacOS/
+        .and_then(|p| p.parent()) // Contents/
+        .and_then(|p| p.parent())
+    // OpenSCAD.app/
+    {
+        let status = Command::new("xattr").arg("-cr").arg(app_bundle).status();
+        match status {
+            Ok(s) if s.success() => {
+                eprintln!(
+                    "[render] Stripped quarantine attributes from {:?}",
+                    app_bundle
+                );
+            }
+            Ok(s) => {
+                eprintln!(
+                    "[render] xattr -cr exited with {} for {:?}",
+                    s.code().unwrap_or(-1),
+                    app_bundle
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "[render] Failed to run xattr -cr on {:?}: {}",
+                    app_bundle, e
+                );
+            }
+        }
+    }
 }
 
 /// Get the OpenSCAD version string from the binary.
@@ -280,6 +325,10 @@ pub async fn render_init(
 ) -> Result<String, String> {
     let binary_path =
         resolve_binary_path(&app).ok_or("OpenSCAD binary not found. Install OpenSCAD or place the binary in the app's binaries/ directory.")?;
+
+    // Strip quarantine/provenance attributes before first use. On macOS 26+,
+    // these attributes cause SIGKILL when spawning nested app bundles.
+    strip_quarantine(&binary_path);
 
     let version = get_binary_version(&binary_path).unwrap_or_else(|| "unknown".to_string());
     eprintln!(
