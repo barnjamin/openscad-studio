@@ -226,12 +226,16 @@ describe('SettingsDialog privacy copy', () => {
 
     expect(await screen.findByText('External Agents')).toBeTruthy();
     expect(screen.getByText('Enable local MCP server')).toBeTruthy();
-    expect(screen.getByText('Claude Code')).toBeTruthy();
-    expect(screen.getByText('Codex')).toBeTruthy();
-    expect(screen.getByText('Cursor')).toBeTruthy();
-    expect(screen.getByText('OpenCode')).toBeTruthy();
-    expect(screen.getByText(/get_or_create_workspace/i)).toBeTruthy();
-    expect(screen.getAllByRole('button', { name: 'Copy' }).length).toBeGreaterThanOrEqual(5);
+    expect(screen.getByRole('tab', { name: /Claude Code/i })).toHaveAttribute(
+      'aria-selected',
+      'true'
+    );
+    expect(screen.getByRole('tab', { name: /Codex/i })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /Cursor/i })).toBeTruthy();
+    expect(screen.getByRole('tab', { name: /OpenCode/i })).toBeTruthy();
+    expect(screen.getByText(/claude mcp add --transport http --scope user/i)).toBeTruthy();
+    expect(screen.getAllByText(/get_or_create_workspace/i).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole('button', { name: 'Copy' }).length).toBeGreaterThanOrEqual(2);
     expect(screen.getAllByText(/http:\/\/127\.0\.0\.1:32123\/mcp/i).length).toBeGreaterThan(0);
     expect(mockGetDesktopMcpStatus).toHaveBeenCalled();
   });

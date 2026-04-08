@@ -35,3 +35,4 @@ export { Tooltip, TooltipTrigger, TooltipContent, TooltipProvider } from './Tool
 export type { TooltipProviderProps } from './Tooltip';
 
 export { Accordion, AccordionItem, AccordionTrigger, AccordionContent } from './Accordion';
+export { Tabs, TabsList, TabsTrigger, TabsContent } from './Tabs';

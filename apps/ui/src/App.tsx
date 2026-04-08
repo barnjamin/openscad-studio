@@ -1028,9 +1028,11 @@ function App() {
     if (Object.keys(state.files).length === 0) {
       const tab = activeTabRef.current;
       const defaultContent = '// Type your OpenSCAD code here\ncube([10, 10, 10]);';
-      void initializeProject(tab.filePath, tab.name, defaultContent);
+      // Seed the untitled web project without hydrating workspace state.
+      // Explicit file/folder opens should transition out of welcome, but the
+      // initial empty project should stay behind the welcome screen.
+      state.openProject(null, { [tab.name]: defaultContent }, tab.name);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Keep refs in sync with state

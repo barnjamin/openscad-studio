@@ -1,17 +1,14 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { Button, Input, Text, Toggle } from '../ui';
 import type { Settings } from '../../stores/settingsStore';
 import { updateSetting } from '../../stores/settingsStore';
 import {
-  buildClaudeMcpCommand,
-  buildCodexMcpCommand,
-  buildCursorMcpConfig,
-  buildOpenCodeMcpConfig,
   getDesktopMcpStatus,
   syncDesktopMcpConfig,
   type McpServerStatus,
 } from '../../services/desktopMcp';
 import { notifyError, notifySuccess } from '../../utils/notifications';
+import { AgentSetupTabs } from '../mcp/AgentSetupTabs';
 import {
   SettingsCard,
   SettingsCardHeader,
@@ -95,10 +92,6 @@ export function ExternalAgentsCard({ settings, isOpen }: ExternalAgentsCardProps
   }, [isOpen, refreshStatus]);
 
   const endpoint = status.endpoint ?? `http://127.0.0.1:${status.port}/mcp`;
-  const claudeCommand = useMemo(() => buildClaudeMcpCommand(status.port), [status.port]);
-  const cursorConfig = useMemo(() => buildCursorMcpConfig(status.port), [status.port]);
-  const codexCommand = useMemo(() => buildCodexMcpCommand(status.port), [status.port]);
-  const openCodeConfig = useMemo(() => buildOpenCodeMcpConfig(status.port), [status.port]);
 
   const copyText = useCallback(async (label: string, value: string) => {
     try {
@@ -270,105 +263,7 @@ export function ExternalAgentsCard({ settings, isOpen }: ExternalAgentsCardProps
           </div>
         </SettingsSupportBlock>
 
-        <SettingsSupportBlock className="flex flex-col" style={{ gap: 'var(--space-helper-gap)' }}>
-          <Text variant="caption" weight="semibold">
-            Claude Code
-          </Text>
-          <div
-            className="flex items-start justify-between"
-            style={{ gap: 'var(--space-control-gap)' }}
-          >
-            <Text as="code" variant="caption" className="font-mono break-all">
-              {claudeCommand}
-            </Text>
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              onClick={() => void copyText('Claude command', claudeCommand)}
-            >
-              Copy
-            </Button>
-          </div>
-        </SettingsSupportBlock>
-
-        <SettingsSupportBlock className="flex flex-col" style={{ gap: 'var(--space-helper-gap)' }}>
-          <Text variant="caption" weight="semibold">
-            Cursor
-          </Text>
-          <Text variant="caption" color="tertiary">
-            Add this to{' '}
-            <Text as="code" variant="caption" className="font-mono">
-              ~/.cursor/mcp.json
-            </Text>
-          </Text>
-          <div
-            className="flex items-start justify-between"
-            style={{ gap: 'var(--space-control-gap)' }}
-          >
-            <Text as="code" variant="caption" className="font-mono break-all whitespace-pre-wrap">
-              {cursorConfig}
-            </Text>
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              onClick={() => void copyText('Cursor config', cursorConfig)}
-            >
-              Copy
-            </Button>
-          </div>
-        </SettingsSupportBlock>
-
-        <SettingsSupportBlock className="flex flex-col" style={{ gap: 'var(--space-helper-gap)' }}>
-          <Text variant="caption" weight="semibold">
-            Codex
-          </Text>
-          <div
-            className="flex items-start justify-between"
-            style={{ gap: 'var(--space-control-gap)' }}
-          >
-            <Text as="code" variant="caption" className="font-mono break-all">
-              {codexCommand}
-            </Text>
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              onClick={() => void copyText('Codex command', codexCommand)}
-            >
-              Copy
-            </Button>
-          </div>
-        </SettingsSupportBlock>
-
-        <SettingsSupportBlock className="flex flex-col" style={{ gap: 'var(--space-helper-gap)' }}>
-          <Text variant="caption" weight="semibold">
-            OpenCode
-          </Text>
-          <Text variant="caption" color="tertiary">
-            Add this to{' '}
-            <Text as="code" variant="caption" className="font-mono">
-              ~/.config/opencode/opencode.json
-            </Text>
-          </Text>
-          <div
-            className="flex items-start justify-between"
-            style={{ gap: 'var(--space-control-gap)' }}
-          >
-            <Text as="code" variant="caption" className="font-mono break-all whitespace-pre-wrap">
-              {openCodeConfig}
-            </Text>
-            <Button
-              type="button"
-              size="sm"
-              variant="ghost"
-              onClick={() => void copyText('OpenCode config', openCodeConfig)}
-            >
-              Copy
-            </Button>
-          </div>
-        </SettingsSupportBlock>
+        <AgentSetupTabs port={status.port} surface="settings" />
 
         {status.message ? (
           <SettingsSupportBlock
