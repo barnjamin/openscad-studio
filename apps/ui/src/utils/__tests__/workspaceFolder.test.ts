@@ -36,6 +36,22 @@ describe('workspaceFolder', () => {
     expect(platform.writeTextFile).not.toHaveBeenCalled();
   });
 
+  it('prefers a nested entrypoint whose basename matches the workspace folder name', async () => {
+    const platform = {
+      createDirectory: jest.fn(),
+      readDirectoryFiles: jest.fn(async () => ({
+        'openscad/config.scad': '// config',
+        'openscad/poly555.scad': 'include <config.scad>;',
+      })),
+      readSubdirectories: jest.fn(async () => ['openscad']),
+      writeTextFile: jest.fn(),
+    };
+
+    const result = await loadWorkspaceFolder(platform, '/tmp/poly555');
+
+    expect(result.renderTargetPath).toBe('openscad/poly555.scad');
+  });
+
   it('creates a default main.scad file when opening an empty folder in create mode', async () => {
     const platform = {
       createDirectory: jest.fn(async () => {}),

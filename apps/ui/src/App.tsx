@@ -46,10 +46,10 @@ import { useMobileLayout } from './hooks/useMobileLayout';
 import { getPlatform, eventBus, type ExportFormat } from './platform';
 import { isExportValidationError } from './services/exportErrors';
 import {
+  notifyDesktopMcpRenderStarted,
   notifyDesktopMcpRenderSettled,
   syncDesktopMcpConfig,
   syncDesktopMcpWindowContext,
-  updateDesktopMcpPreviewState,
 } from './services/desktopMcp';
 import { getRenderService } from './services/renderService';
 import { getPreviewSceneStyle } from './services/previewSceneConfig';
@@ -63,15 +63,19 @@ import {
   selectActiveTabId,
   selectShowWelcome,
   selectTabs,
-  selectWorkingDirectory,
 } from './stores/workspaceSelectors';
 import { useWorkspaceStore, getWorkspaceState } from './stores/workspaceStore';
 import { getProjectStore, useProjectStore, getRenderTargetContent } from './stores/projectStore';
 import { requestRender } from './stores/renderRequestStore';
+import {
+  createSourceHash,
+  getRenderArtifactState,
+  useRenderArtifactStore,
+} from './stores/renderArtifactStore';
 import { DEFAULT_TAB_NAME } from './stores/workspaceFactories';
 import { formatOpenScadCode } from './utils/formatter';
 import { addRecentFile, removeRecentFile } from './utils/recentFiles';
-import { captureCurrentPreview } from './utils/capturePreview';
+import { captureCurrentPreview, MAIN_PREVIEW_VIEWER_ID } from './utils/capturePreview';
 import { normalizeAppError, notifyError, notifySuccess } from './utils/notifications';
 import { exportProjectZip } from './utils/projectZip';
 import { getRelativeProjectPath } from './utils/projectFilePaths';
@@ -101,7 +105,6 @@ type MacArch = 'aarch64' | 'x64';
 const OPENSCAD_FILE_FILTERS = [
   { name: 'OpenSCAD Files', extensions: [...OPENSCAD_PROJECT_FILE_EXTENSIONS] },
 ];
-
 /** Prompt the user to pick a folder and return its project files, or null if cancelled. */
 function pickFolder(): Promise<{ files: Record<string, string>; renderTargetPath: string } | null> {
   return new Promise((resolve) => {
@@ -116,19 +119,21 @@ function pickFolder(): Promise<{ files: Record<string, string>; renderTargetPath
       }
 
       const files: Record<string, string> = {};
+      let workspaceName: string | null = null;
       for (const file of Array.from(fileList)) {
         // webkitRelativePath gives "folderName/path/to/file.scad"
         const relativePath = file.webkitRelativePath;
         if (!isOpenScadProjectFilePath(relativePath)) continue;
         // Strip the top-level folder name
         const parts = relativePath.split('/');
+        workspaceName ??= parts[0] || null;
         const pathWithoutRoot = parts.slice(1).join('/');
         if (pathWithoutRoot) {
           files[pathWithoutRoot] = await file.text();
         }
       }
 
-      const renderTargetPath = pickOpenScadRenderTarget(Object.keys(files));
+      const renderTargetPath = pickOpenScadRenderTarget(Object.keys(files), null, workspaceName);
       if (!renderTargetPath) {
         resolve(null);
         return;
@@ -280,7 +285,9 @@ function App() {
   const projectRoot = useProjectStore((s) => s.projectRoot);
   const renderTargetTab = tabs.find((t) => t.projectPath === renderTargetPath);
   const renderTargetRender = renderTargetTab?.render ?? activeRender;
-  const workingDir = useWorkspaceStore(selectWorkingDirectory);
+  const activeRenderArtifact = useRenderArtifactStore((state) =>
+    renderTargetPath ? state.artifactsByTarget[renderTargetPath] ?? null : null
+  );
   const createTab = useWorkspaceStore((state) => state.createTab);
   const setActiveTab = useWorkspaceStore((state) => state.setActiveTab);
   const markTabSaved = useWorkspaceStore((state) => state.markTabSaved);
@@ -386,7 +393,7 @@ function App() {
     source: renderTargetContent,
     contentVersion,
     suppressInitialRender: Boolean(initialShareContext) || showWelcome,
-    workingDir,
+    workingDir: projectRoot,
     autoRenderOnIdle: settings.editor.autoRenderOnIdle,
     autoRenderDelayMs: settings.editor.autoRenderDelayMs,
     library: settings.library,
@@ -400,15 +407,46 @@ function App() {
       }
 
       const tab = rtTab ?? activeTabRef.current;
+      const requestId = beginTabRender(tabId, {
+        preferredDimension: tab?.render.dimensionMode,
+      });
+      const targetPath = rtPath ?? tab?.projectPath ?? activeTabRef.current.projectPath;
+      const currentProjectRoot = getProjectStore().getState().projectRoot;
+
+      getRenderArtifactState().setActiveRenderTarget(targetPath, currentProjectRoot);
+      notifyDesktopMcpRenderStarted({
+        renderTargetPath: targetPath,
+        requestId,
+      });
+
       return {
         tabId,
-        requestId: beginTabRender(tabId, {
-          preferredDimension: tab?.render.dimensionMode,
-        }),
+        requestId,
       };
     },
     onRenderSettled: ({ owner, code, snapshot }) => {
-      notifyDesktopMcpRenderSettled(snapshot);
+      const settledRenderTargetPath =
+        getProjectStore().getState().renderTargetPath ??
+        (owner
+          ? getWorkspaceState().tabs.find((tab) => tab.id === owner.tabId)?.projectPath ?? null
+          : null);
+      if (owner && settledRenderTargetPath) {
+        getRenderArtifactState().publishSettledArtifact({
+          requestId: owner.requestId,
+          renderTargetPath: settledRenderTargetPath,
+          workspaceRoot: getProjectStore().getState().projectRoot,
+          sourceHash: createSourceHash(code),
+          previewKind: snapshot.previewKind,
+          previewSrc: snapshot.previewSrc,
+          diagnostics: snapshot.diagnostics,
+          error: snapshot.error,
+          dimensionMode: snapshot.dimensionMode,
+          sceneStyle: previewSceneStyle,
+          useModelColors: settings.viewer.showModelColors,
+          createdAt: Date.now(),
+        });
+      }
+      notifyDesktopMcpRenderSettled(owner?.requestId ?? null);
 
       if (!owner) {
         return;
@@ -441,11 +479,12 @@ function App() {
       });
     },
   });
-  const activePreviewSrc = renderTargetRender?.previewSrc ?? '';
-  const activePreviewKind = renderTargetRender?.previewKind ?? previewKind;
-  const activeDiagnostics = renderTargetRender?.diagnostics ?? diagnostics;
-  const activeError = renderTargetRender?.error ?? error;
-  const activePreviewViewerId = activeTabId;
+  const activePreviewSrc = activeRenderArtifact?.previewSrc ?? renderTargetRender?.previewSrc ?? '';
+  const activePreviewKind =
+    activeRenderArtifact?.previewKind ?? renderTargetRender?.previewKind ?? previewKind;
+  const activeDiagnostics =
+    activeRenderArtifact?.diagnostics ?? renderTargetRender?.diagnostics ?? diagnostics;
+  const activeError = activeRenderArtifact?.error ?? renderTargetRender?.error ?? error;
 
   const handleOpenFallbackEditor = useCallback(() => {
     setShowNux(false);
@@ -456,6 +495,10 @@ function App() {
       requestRender('initial', { immediate: true });
     }
   }, [renderTargetRender?.lastRenderedContent, hideWelcomeScreen, ready]);
+
+  useEffect(() => {
+    getRenderArtifactState().setActiveRenderTarget(renderTargetPath ?? null, projectRoot);
+  }, [projectRoot, renderTargetPath]);
 
   const initializeProject = useCallback(
     async (filePath: string | null, fileName: string, content: string) => {
@@ -1051,14 +1094,14 @@ function App() {
   useEffect(() => {
     updateCapturePreview(() =>
       captureCurrentPreview({
-        viewerId: activePreviewViewerId,
+        viewerId: MAIN_PREVIEW_VIEWER_ID,
         svgSourceUrl: activePreviewKind === 'svg' ? activePreviewSrc : null,
         targetWidth: 1200,
         targetHeight: 630,
       })
     );
     return () => updateCapturePreview(null);
-  }, [activePreviewKind, activePreviewSrc, activePreviewViewerId, updateCapturePreview]);
+  }, [activePreviewKind, activePreviewSrc, updateCapturePreview]);
 
   useEffect(() => {
     updatePreviewSceneStyle(previewSceneStyle);
@@ -1067,22 +1110,6 @@ function App() {
   useEffect(() => {
     updateUseModelColors(settings.viewer.showModelColors);
   }, [settings.viewer.showModelColors, updateUseModelColors]);
-
-  useEffect(() => {
-    updateDesktopMcpPreviewState({
-      previewKind: activePreviewKind,
-      previewSrc: activePreviewSrc,
-      previewViewerId: activePreviewViewerId,
-      previewSceneStyle,
-      useModelColors: settings.viewer.showModelColors,
-    });
-  }, [
-    activePreviewKind,
-    activePreviewSrc,
-    activePreviewViewerId,
-    previewSceneStyle,
-    settings.viewer.showModelColors,
-  ]);
 
   useEffect(() => {
     if (isShareEntry) {
@@ -2528,7 +2555,7 @@ function App() {
         isOpen={showExportDialog}
         onClose={() => setShowExportDialog(false)}
         source={renderTargetContent}
-        workingDir={workingDir}
+        workingDir={projectRoot}
         previewKind={activePreviewKind}
       />
       <ShareDialog
@@ -2539,7 +2566,7 @@ function App() {
         forkedFrom={shareOrigin?.shareId ?? null}
         capturePreview={() =>
           captureCurrentPreview({
-            viewerId: activePreviewViewerId,
+            viewerId: MAIN_PREVIEW_VIEWER_ID,
             svgSourceUrl: activePreviewKind === 'svg' ? activePreviewSrc : null,
             targetWidth: 1200,
             targetHeight: 630,

@@ -387,4 +387,69 @@ describe('useOpenScad', () => {
     expect(renderService.render).toHaveBeenCalledTimes(1);
     expect(hook.current().diagnostics).toEqual([]);
   });
+
+  it('renders nested targets relative to the workspace root while preserving the nested input path', async () => {
+    const projectStore = getProjectStore();
+    projectStore.getState().openProject(
+      '/repo',
+      {
+        'openscad/poly555.scad': 'include <config.scad>;\nuse <lib/keys.scad>;\npoly555();',
+        'openscad/config.scad': 'SHOW_ENCLOSURE_BOTTOM = true;',
+        'openscad/lib/keys.scad': 'module poly555() cube(10);',
+      },
+      'openscad/poly555.scad'
+    );
+
+    const renderService = {
+      init: jest.fn(async () => undefined),
+      getCached: jest.fn(async () => null),
+      render: jest.fn(async () => ({
+        output: new Uint8Array([1]),
+        kind: 'mesh' as const,
+        diagnostics: [],
+      })),
+    };
+    const resolveDeps = jest.fn(async () => ({
+      'openscad/config.scad': 'SHOW_ENCLOSURE_BOTTOM = true;',
+      'openscad/lib/keys.scad': 'module poly555() cube(10);',
+    }));
+
+    const hook = createHarness({
+      suppressInitialRender: true,
+      source: projectStore.getState().files['openscad/poly555.scad']?.content ?? '',
+      contentVersion: projectStore.getState().contentVersion,
+      workingDir: '/repo',
+      testOverrides: {
+        renderService: renderService as never,
+        resolveWorkingDirDeps: resolveDeps as never,
+      },
+    });
+
+    await waitFor(() => {
+      expect(hook.current().ready).toBe(true);
+    });
+
+    await act(async () => {
+      await hook.current().manualRender();
+    });
+
+    expect(resolveDeps).toHaveBeenCalledWith(
+      'include <config.scad>;\nuse <lib/keys.scad>;\npoly555();',
+      expect.objectContaining({
+        workingDir: '/repo',
+        renderTargetDir: 'openscad',
+      })
+    );
+    expect(renderService.render).toHaveBeenCalledWith(
+      'include <config.scad>;\nuse <lib/keys.scad>;\npoly555();',
+      expect.objectContaining({
+        workingDir: '/repo',
+        inputPath: 'openscad/poly555.scad',
+        auxiliaryFiles: {
+          'openscad/config.scad': 'SHOW_ENCLOSURE_BOTTOM = true;',
+          'openscad/lib/keys.scad': 'module poly555() cube(10);',
+        },
+      })
+    );
+  });
 });

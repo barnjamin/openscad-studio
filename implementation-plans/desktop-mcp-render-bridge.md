@@ -19,6 +19,10 @@ Add a desktop-only localhost MCP server that exposes Studio-specific render and 
 11. Replace window-level "launch complete" bookkeeping with request-scoped open results that verify the exact folder opened before MCP binds the session.
 12. Move startup-open orchestration into `main.tsx` so the full app shell mounts only after the window reaches a stable `welcome`, `ready`, or `open_failed` state.
 13. Keep `App.tsx` focused on the editor shell while one shared window-open service handles startup opens, menu opens, recent-item opens, and MCP reuse.
+14. Tighten desktop MCP render failure signaling so `trigger_render` fails on actual render errors and preview-dependent tools return actionable troubleshooting guidance.
+15. Fix desktop workspace default render-target selection and nested render-target path handling so MCP can render entrypoints under subfolders without duplicated path segments.
+16. Make MCP-triggered renders refresh a coherent dependency snapshot from disk so external edits do not mix fresh entry files with stale in-memory includes.
+17. Redesign MCP preview readback around a canonical render artifact store so screenshots, diagnostics, and render completion no longer depend on active-tab UI state.
 
 ## Affected Areas
 
@@ -29,7 +33,9 @@ Add a desktop-only localhost MCP server that exposes Studio-specific render and 
 - `apps/ui/src/App.tsx`
 - `apps/ui/src/platform/`
 - `apps/ui/src/platform/eventBus.ts`
+- `packages/shared/src/openscadProjectFiles.ts`
 - `apps/ui/src/utils/workspaceFolder.ts`
+- `apps/ui/src-tauri/src/cmd/render.rs`
 - `implementation-plans/desktop-mcp-render-bridge.md`
 
 ## Checklist
@@ -61,3 +67,14 @@ Add a desktop-only localhost MCP server that exposes Studio-specific render and 
 - [x] Extract one shared window-open service for folder/file hydration across startup, menu, recent-item, and MCP flows
 - [x] Remove startup-open orchestration from `App.tsx` so MCP correctness no longer depends on passive effects
 - [x] Restore the codebase to production mode by removing temporary startup diagnosis logging and debug commands
+- [x] Make desktop MCP render-triggering fail on render/runtime and diagnostic errors instead of always returning success
+- [x] Add contextual troubleshooting guidance for screenshot/export failures when the preview or current render target is unusable
+- [x] Add desktop MCP bridge tests for render failure signaling and preview-related recovery guidance
+- [x] Unify folder-open render-target picking around the shared helper and prefer workspace-name entrypoints over support files
+- [x] Harden native desktop render path normalization so nested render targets remain project-relative and duplicated leading segments collapse safely
+- [x] Add regression coverage for nested default entrypoints and nested native render temp-file placement
+- [x] Refresh MCP render-target dependency snapshots from disk while preserving dirty in-app files as overrides
+- [x] Reuse the coherent MCP snapshot refresh path for diagnostics and export flows
+- [x] Add targeted tests for MCP snapshot refresh, missing dependencies, and disk-first dependency resolution
+- [x] Restore the desktop render-root contract so nested workspace targets render with the workspace root as `workingDir` and the nested file path only in `inputPath`
+- [x] Replace the MCP preview mirror with a canonical render artifact store and explicit-view screenshot contract

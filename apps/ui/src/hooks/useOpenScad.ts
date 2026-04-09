@@ -10,6 +10,7 @@ import { getPlatform } from '../platform';
 import type { LibrarySettings } from '../stores/settingsStore';
 import { resolveWorkingDirDeps } from '../utils/resolveWorkingDirDeps';
 import { getProjectState, getAuxiliaryFilesForRender } from '../stores/projectStore';
+import { normalizeProjectRelativePath } from '../utils/projectFilePaths';
 import { notifyError } from '../utils/notifications';
 import { hasRenderableOutput } from './renderOutput';
 export type RenderKind = 'mesh' | 'svg';
@@ -243,7 +244,9 @@ export function useOpenScad(options: UseOpenScadOptions = {}) {
 
         if (workingDir) {
           const platform = getPlatformImpl();
-          const renderTargetPath = getProjectState().renderTargetPath;
+          const renderTargetPath = normalizeProjectRelativePath(
+            getProjectState().renderTargetPath ?? ''
+          );
           const rtLastSlash = renderTargetPath?.lastIndexOf('/') ?? -1;
           const renderTargetDir =
             renderTargetPath && rtLastSlash > 0
@@ -281,7 +284,8 @@ export function useOpenScad(options: UseOpenScadOptions = {}) {
           auxiliaryFiles: Object.keys(allAuxFiles).length > 0 ? allAuxFiles : undefined,
           libraryFiles: Object.keys(libraryFiles).length > 0 ? libraryFiles : undefined,
           libraryPaths: libraryPathsRef.current.length > 0 ? libraryPathsRef.current : undefined,
-          inputPath: getProjectState().renderTargetPath ?? undefined,
+          inputPath:
+            normalizeProjectRelativePath(getProjectState().renderTargetPath ?? '') ?? undefined,
           workingDir: workingDir || undefined,
         } as const;
 

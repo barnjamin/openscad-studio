@@ -1,5 +1,6 @@
 import type { PlatformBridge } from '../platform';
 import { DEFAULT_OPENSCAD_CODE, DEFAULT_TAB_NAME } from '../stores/workspaceFactories';
+import { pickOpenScadRenderTarget } from '../../../../packages/shared/src/openscadProjectFiles';
 
 export interface WorkspaceFolderLoadOptions {
   createIfEmpty?: boolean;
@@ -28,15 +29,11 @@ export function findEmptyFolders(allDirs: string[], filePaths: string[]): string
   });
 }
 
-function pickRenderTarget(filePaths: string[]): string | null {
-  if (filePaths.length === 0) {
-    return null;
-  }
-
-  return (
-    filePaths.find((filePath) => filePath === DEFAULT_TAB_NAME) ??
-    [...filePaths].sort((a, b) => a.localeCompare(b))[0]
-  );
+function getWorkspaceName(dirPath: string): string | null {
+  const normalizedPath = dirPath.replace(/\\/g, '/').replace(/\/+$/, '');
+  const lastSlash = normalizedPath.lastIndexOf('/');
+  const folderName = lastSlash >= 0 ? normalizedPath.slice(lastSlash + 1) : normalizedPath;
+  return folderName || null;
 }
 
 export async function loadWorkspaceFolder(
@@ -60,7 +57,7 @@ export async function loadWorkspaceFolder(
     filePaths = [DEFAULT_TAB_NAME];
   }
 
-  const renderTargetPath = pickRenderTarget(filePaths);
+  const renderTargetPath = pickOpenScadRenderTarget(filePaths, null, getWorkspaceName(dirPath));
   if (!renderTargetPath) {
     throw new Error('Could not determine a render target for the workspace');
   }

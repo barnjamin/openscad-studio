@@ -848,9 +848,8 @@ pub struct SetRenderTargetParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetPreviewScreenshotParams {
-    /// View perspective: "current", "front", "back", "left", "right", "top", "bottom", or "isometric"
-    #[serde(default)]
-    pub view: Option<String>,
+    /// View perspective: "front", "back", "left", "right", "top", "bottom", or "isometric"
+    pub view: String,
     /// Camera azimuth angle in degrees
     #[serde(default)]
     pub azimuth: Option<f64>,
@@ -976,20 +975,24 @@ impl OpenScadMcpHandler {
     }
 
     #[tool(
-        description = "Render the current Studio render target and return the latest diagnostics."
+        description = "Render the current Studio render target and report the latest diagnostics without failing on compile errors."
     )]
     async fn get_diagnostics(&self) -> Result<CallToolResult, McpError> {
         self.call_frontend("get_diagnostics", serde_json::json!({}))
             .await
     }
 
-    #[tool(description = "Render the current Studio render target and refresh the preview.")]
+    #[tool(
+        description = "Render the current Studio render target, refresh the preview, and fail if the render reports errors."
+    )]
     async fn trigger_render(&self) -> Result<CallToolResult, McpError> {
         self.call_frontend("trigger_render", serde_json::json!({}))
             .await
     }
 
-    #[tool(description = "Capture a PNG screenshot of Studio's current preview.")]
+    #[tool(
+        description = "Capture a PNG screenshot of the latest settled render artifact for the current render target. Requires an explicit 3D view such as front, top, or isometric."
+    )]
     async fn get_preview_screenshot(
         &self,
         Parameters(params): Parameters<GetPreviewScreenshotParams>,
@@ -1002,7 +1005,9 @@ impl OpenScadMcpHandler {
         self.call_frontend("get_preview_screenshot", args).await
     }
 
-    #[tool(description = "Export the current render target to a file path on desktop.")]
+    #[tool(
+        description = "Export the current render target to a file path on desktop. If export cannot proceed, the response explains how to verify the render target and diagnostics."
+    )]
     async fn export_file(
         &self,
         Parameters(params): Parameters<ExportFileParams>,

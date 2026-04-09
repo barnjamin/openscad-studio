@@ -1,5 +1,7 @@
 import { captureSvgPreviewImage, type SvgPreviewImageOptions } from './captureSvgPreviewImage';
 
+export const MAIN_PREVIEW_VIEWER_ID = 'workspace-preview';
+
 export type CaptureCurrentPreviewOptions = Pick<
   SvgPreviewImageOptions,
   'svgSourceUrl' | 'targetWidth' | 'targetHeight'

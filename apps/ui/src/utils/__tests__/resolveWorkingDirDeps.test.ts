@@ -1,5 +1,9 @@
 import { jest } from '@jest/globals';
-import { normalizePath, resolveWorkingDirDeps } from '../resolveWorkingDirDeps';
+import {
+  normalizePath,
+  resolveWorkingDirDeps,
+  resolveWorkingDirDepsDetailed,
+} from '../resolveWorkingDirDeps';
 import type { PlatformBridge } from '../../platform/types';
 
 describe('normalizePath', () => {
@@ -114,6 +118,29 @@ describe('resolveWorkingDirDeps', () => {
     expect(result).toEqual({
       'a.scad': 'include <b.scad>\nmodule a() { b(); }',
       'b.scad': 'module b() { cube(1); }',
+    });
+  });
+
+  it('resolves transitive includes relative to the included file directory', async () => {
+    const platform = createMockPlatform({
+      '/project/openscad/lib/enclosure.scad':
+        'include <values.scad>\ninclude <basic_shapes.scad>\nmodule enclosure() {}',
+      '/project/openscad/lib/values.scad': 'keys_x = 10;',
+      '/project/openscad/lib/basic_shapes.scad': 'module rounded_cube() {}',
+    });
+
+    const result = await resolveWorkingDirDeps('include <lib/enclosure.scad>', {
+      workingDir: '/project',
+      libraryFiles: {},
+      platform: platform as unknown as PlatformBridge,
+      renderTargetDir: 'openscad',
+    });
+
+    expect(result).toEqual({
+      'openscad/lib/enclosure.scad':
+        'include <values.scad>\ninclude <basic_shapes.scad>\nmodule enclosure() {}',
+      'openscad/lib/values.scad': 'keys_x = 10;',
+      'openscad/lib/basic_shapes.scad': 'module rounded_cube() {}',
     });
   });
 
@@ -339,5 +366,45 @@ describe('resolveWorkingDirDeps', () => {
     });
 
     expect(result).toEqual({});
+  });
+
+  it('prefers disk over clean project files when requested, while preserving dirty overrides', async () => {
+    const platform = createMockPlatform({
+      '/project/dep.scad': 'size = 20;',
+    });
+
+    const result = await resolveWorkingDirDepsDetailed('include <dep.scad>\ncube(size);', {
+      workingDir: '/project',
+      libraryFiles: {},
+      platform: platform as unknown as PlatformBridge,
+      projectFiles: {
+        'dep.scad': 'size = 10;',
+      },
+      dirtyProjectFiles: {
+        'dirty.scad': 'unused = true;',
+      },
+      preferDiskForProjectFiles: true,
+      includeProjectFilesAsFallback: false,
+    });
+
+    expect(result.files).toEqual({
+      'dep.scad': 'size = 20;',
+    });
+    expect(result.missingPaths).toEqual([]);
+  });
+
+  it('reports missing dependencies in the detailed resolver result', async () => {
+    const platform = createMockPlatform({});
+
+    const result = await resolveWorkingDirDepsDetailed('include <missing.scad>', {
+      workingDir: '/project',
+      libraryFiles: {},
+      platform: platform as unknown as PlatformBridge,
+      preferDiskForProjectFiles: true,
+      includeProjectFilesAsFallback: false,
+    });
+
+    expect(result.files).toEqual({});
+    expect(result.missingPaths).toEqual(['missing.scad']);
   });
 });
