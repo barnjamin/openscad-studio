@@ -5,6 +5,20 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-04-10
+
+### Added
+- Desktop MCP support for external agents to access project context, diagnostics, renders, and preview screenshots from OpenSCAD Studio.
+- Desktop AI settings now include external agent setup guidance and MCP connection details.
+
+### Changed
+- Improved MCP onboarding and preview artifact flows for desktop agent workflows.
+- Unified AI diagnostics with project render inputs to keep preview and validation feedback aligned.
+
+### Fixed
+- Fixed web startup and AI validation regressions.
+- Fixed the Tauri dev rebuild loop in worktree sessions on macOS.
+
 ## [1.1.0] - 2026-04-08
 
 ### Added
