@@ -68,10 +68,12 @@ function createCompletedToolMessage(): Message {
       path: 'main.scad',
       oldString: 'cube(1);',
       newString: 'cube(2);',
+      rationale: 'make it larger',
     },
     result: {
       success: true,
       summary: 'Updated main.scad',
+      __checkpointId: 'cp-123',
     },
     state: 'completed',
     timestamp: 1,
@@ -111,12 +113,14 @@ describe('AiPromptPanel', () => {
     expect(screen.queryByText(/"path": "main\.scad"/)).toBeNull();
     expect(screen.queryByText(/"summary": "Updated main\.scad"/)).toBeNull();
 
-    fireEvent.click(screen.getByRole('button', { name: /tool details/i }));
+    fireEvent.click(screen.getByRole('button', { name: /expand details for apply_edit/i }));
 
     expect(screen.getByText(/"path": "main\.scad"/)).toBeTruthy();
     expect(screen.getByText(/"newString": "cube\(2\);"/)).toBeTruthy();
     expect(screen.getByText(/"success": true/)).toBeTruthy();
     expect(screen.getByText(/"summary": "Updated main\.scad"/)).toBeTruthy();
+    expect(screen.queryByText(/rationale/i)).toBeNull();
+    expect(screen.queryByText(/checkpoint/i)).toBeNull();
   });
 
   it('shows pending tool inputs and a waiting placeholder when the result is not available yet', () => {
@@ -129,7 +133,7 @@ describe('AiPromptPanel', () => {
       />
     );
 
-    fireEvent.click(screen.getByRole('button', { name: /tool details/i }));
+    fireEvent.click(screen.getByRole('button', { name: /expand details for read_file/i }));
 
     expect(screen.getByText(/"path": "lib\.scad"/)).toBeTruthy();
     expect(screen.getByText('Waiting for result...')).toBeTruthy();

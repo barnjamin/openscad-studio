@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState, forwardRef, useImperativeHandle } from 'react';
 import { ChatImage, ChatImageGrid } from './ChatImage';
-import { Accordion, AccordionContent, AccordionItem, AccordionTrigger, Button } from './ui';
+import { Button } from './ui';
 import { MarkdownMessage } from './MarkdownMessage';
 import { ModelSelector } from './ModelSelector';
 import { AiComposer, type AiComposerRef } from './AiComposer';
@@ -148,10 +148,9 @@ function sanitizeToolDetailValue(value: unknown, seen = new WeakSet<object>()): 
     }
 
     return Object.fromEntries(
-      Object.entries(value as Record<string, unknown>).map(([key, entryValue]) => [
-        key,
-        sanitizeToolDetailValue(entryValue, seen),
-      ])
+      Object.entries(value as Record<string, unknown>)
+        .filter(([key]) => key !== 'rationale' && !key.startsWith('__'))
+        .map(([key, entryValue]) => [key, sanitizeToolDetailValue(entryValue, seen)])
     );
   }
 
@@ -240,6 +239,7 @@ interface ToolCallCardProps {
 }
 
 function ToolCallCard({ toolName, state, args, result, errorText }: ToolCallCardProps) {
+  const [expanded, setExpanded] = useState(false);
   const toolStateMeta = getToolStateMeta(state);
   const imageDataUrl =
     toolName === 'get_preview_screenshot' ? getImageDataUrlFromResult(result) : null;
@@ -252,7 +252,16 @@ function ToolCallCard({ toolName, state, args, result, errorText }: ToolCallCard
         borderColor: toolStateMeta.borderColor,
       }}
     >
-      <div className="flex items-center gap-2 text-sm">
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="flex w-full items-center justify-start gap-2 p-0 text-left text-sm"
+        style={{ height: 'auto' }}
+        onClick={() => setExpanded((current) => !current)}
+        aria-expanded={expanded}
+        aria-label={`${expanded ? 'Collapse' : 'Expand'} details for ${toolName}`}
+      >
         {toolStateMeta.icon}
         <span className="font-semibold" style={{ color: toolStateMeta.color }}>
           {toolName}
@@ -260,47 +269,52 @@ function ToolCallCard({ toolName, state, args, result, errorText }: ToolCallCard
         <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
           {toolStateMeta.label}
         </span>
-      </div>
-      {errorText && (
-        <div className="mt-2 text-xs" style={{ color: 'var(--color-error)' }}>
-          {errorText}
+        <span className="ml-auto flex h-5 w-5 items-center justify-center">
+          <svg
+            width="14"
+            height="14"
+            viewBox="0 0 12 12"
+            fill="none"
+            xmlns="http://www.w3.org/2000/svg"
+            style={{
+              color: 'var(--text-tertiary)',
+              transform: expanded ? 'rotate(90deg)' : 'rotate(0deg)',
+              transition: 'transform 120ms ease',
+            }}
+          >
+            <path
+              d="M4.5 2.5L7.5 6L4.5 9.5"
+              stroke="currentColor"
+              strokeWidth="1.5"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+            />
+          </svg>
+        </span>
+      </Button>
+      {expanded && (
+        <div
+          className="mt-2 space-y-2 border-t pt-2"
+          style={{ borderColor: 'var(--border-secondary)' }}
+        >
+          {errorText && (
+            <div className="text-xs" style={{ color: 'var(--color-error)' }}>
+              {errorText}
+            </div>
+          )}
+          {imageDataUrl && (
+            <div>
+              <ChatImage src={imageDataUrl} alt="Preview screenshot" filename="preview.png" />
+            </div>
+          )}
+          <ToolCallDetailSection label="Input" value={args} emptyLabel="No input parameters." />
+          <ToolCallDetailSection
+            label="Result"
+            value={result}
+            emptyLabel={getMissingToolResultLabel(state)}
+          />
         </div>
       )}
-      {imageDataUrl && (
-        <div className="mt-2">
-          <ChatImage src={imageDataUrl} alt="Preview screenshot" filename="preview.png" />
-        </div>
-      )}
-      <div className="mt-2 rounded-md border" style={{ borderColor: 'var(--border-secondary)' }}>
-        <Accordion type="single" collapsible>
-          <AccordionItem value="details" className="border-none">
-            <AccordionTrigger
-              className="flex w-full items-center justify-between gap-3 px-2 py-1.5 text-left text-xs font-medium"
-              style={{ color: 'var(--text-secondary)' }}
-            >
-              <span>Tool details</span>
-              <span style={{ color: 'var(--text-tertiary)' }}>Expand</span>
-            </AccordionTrigger>
-            <AccordionContent className="px-2 pb-2">
-              <div
-                className="space-y-2 border-t pt-2"
-                style={{ borderColor: 'var(--border-secondary)' }}
-              >
-                <ToolCallDetailSection
-                  label="Input"
-                  value={args}
-                  emptyLabel="No input parameters."
-                />
-                <ToolCallDetailSection
-                  label="Result"
-                  value={result}
-                  emptyLabel={getMissingToolResultLabel(state)}
-                />
-              </div>
-            </AccordionContent>
-          </AccordionItem>
-        </Accordion>
-      </div>
     </div>
   );
 }

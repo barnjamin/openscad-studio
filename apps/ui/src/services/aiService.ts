@@ -68,7 +68,7 @@ You are an expert OpenSCAD assistant helping users design and modify 3D models. 
 1. Start by calling \`get_project_context\` to understand what exists (render target + code + file listing)
 2. Optionally use \`get_preview_screenshot\` to see the rendered output
 3. For fixes, use \`get_diagnostics\` to see what errors exist
-4. Use \`apply_edit\` with the exact old text, new replacement, and a rationale explaining the change
+4. Use \`apply_edit\` with the exact old text and new replacement
 5. The preview updates automatically after successful edits
 6. After all edits are complete, call \`get_diagnostics\` to verify the code compiles without new errors. If there are errors, fix them with additional \`apply_edit\` calls.
 
@@ -151,6 +151,12 @@ export function createModel(provider: AiProvider, apiKey: string, modelId: strin
 }
 
 export function buildTools(callbacks: AiToolCallbacks) {
+  const applyEditResultSchema = z.object({
+    status: z.enum(['success']),
+    message: z.string(),
+    __checkpointId: z.string().optional(),
+  });
+
   return {
     get_project_context: tool({
       description:
@@ -277,25 +283,27 @@ export function buildTools(callbacks: AiToolCallbacks) {
           ),
         old_string: z.string().describe('The exact text to find (must be unique in the file)'),
         new_string: z.string().describe('The replacement text'),
-        rationale: z.string().describe('Human-readable explanation of the change'),
       }),
-      execute: async ({ file_path, old_string, new_string, rationale }) => {
+      execute: async ({ file_path, old_string, new_string }) => {
         const renderTarget = callbacks.getRenderTargetPath();
 
         // If targeting a specific non-render-target file, use editProjectFile
         if (file_path && file_path !== renderTarget) {
           const error = callbacks.editProjectFile(file_path, old_string, new_string);
           if (error) {
-            return `❌ Failed to apply edit to ${file_path}: ${error}\n\nRationale: ${rationale}\n\nThe edit was not applied.`;
+            return `❌ Failed to apply edit to ${file_path}: ${error}`;
           }
           callbacks.requestRender('code_update', { immediate: true });
-          return `✅ Edit applied to ${file_path}!\n✅ Preview will update automatically if this file is included by the render target.\n\nRationale: ${rationale}`;
+          return {
+            status: 'success' as const,
+            message: `Edit applied to ${file_path}.`,
+          };
         }
 
         // Edit the render target (with checkpoints)
         const targetPath = file_path ?? renderTarget;
         if (!targetPath) {
-          return `❌ No render target set.\n\nRationale: ${rationale}`;
+          return '❌ No render target set.';
         }
         const currentCode = callbacks.readProjectFile(targetPath) ?? '';
 
@@ -303,14 +311,14 @@ export function buildTools(callbacks: AiToolCallbacks) {
         const checkpointId = historyService.createCheckpoint(
           currentCode,
           [],
-          `Before AI edit: ${rationale}`,
+          'Before AI edit',
           'ai'
         );
 
         // Apply the edit via projectStore
         const error = callbacks.editProjectFile(targetPath, old_string, new_string);
         if (error) {
-          return `❌ Failed to apply edit: ${error}\n\nRationale: ${rationale}\n\nThe edit was not applied. Please check the exact text and try again.`;
+          return `❌ Failed to apply edit: ${error}\n\nThe edit was not applied. Please check the exact text and try again.`;
         }
 
         // Read back the new code for Editor sync
@@ -318,8 +326,18 @@ export function buildTools(callbacks: AiToolCallbacks) {
         eventBus.emit('code-updated', { code: newCode, source: 'ai' });
         callbacks.requestRender('code_update', { immediate: true });
 
-        const checkpointSuffix = `\n[CHECKPOINT:${checkpointId}]`;
-        return `✅ Edit applied successfully!\n✅ Preview has been updated automatically\n\nRationale: ${rationale}\n\nThe changes are now live in the editor.${checkpointSuffix}`;
+        return {
+          status: 'success' as const,
+          message: 'Edit applied successfully.',
+          __checkpointId: checkpointId,
+        };
+      },
+      toModelOutput({ output }) {
+        const parsed = applyEditResultSchema.safeParse(output);
+        if (parsed.success) {
+          return { type: 'text' as const, value: parsed.data.message };
+        }
+        return { type: 'text' as const, value: String(output) };
       },
     }),
 

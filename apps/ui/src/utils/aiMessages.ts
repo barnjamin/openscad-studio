@@ -20,9 +20,17 @@ export function toolResultToOutput(result: unknown) {
       ],
     };
   }
+
+  const sanitizedResult =
+    typeof result === 'object' && result !== null
+      ? Object.fromEntries(
+          Object.entries(result as Record<string, unknown>).filter(([key]) => !key.startsWith('__'))
+        )
+      : result;
+
   return {
     type: 'text' as const,
-    value: typeof result === 'string' ? result : JSON.stringify(result),
+    value: typeof sanitizedResult === 'string' ? sanitizedResult : JSON.stringify(sanitizedResult),
   };
 }
 
