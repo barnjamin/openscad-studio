@@ -45,9 +45,16 @@ import { useHistory } from './hooks/useHistory';
 import { useMobileLayout } from './hooks/useMobileLayout';
 import { getPlatform, eventBus, type ExportFormat } from './platform';
 import { isExportValidationError } from './services/exportErrors';
+import {
+  notifyDesktopMcpRenderStarted,
+  notifyDesktopMcpRenderSettled,
+  syncDesktopMcpConfig,
+  syncDesktopMcpWindowContext,
+} from './services/desktopMcp';
 import { getRenderService } from './services/renderService';
 import { getPreviewSceneStyle } from './services/previewSceneConfig';
 import { isShareEnabled } from './services/shareService';
+import { openFileInWindow, openWorkspaceFolderInWindow } from './services/windowOpenService';
 import { useSettings, loadSettings, updateSetting } from './stores/settingsStore';
 import { getApiKey, getProviderFromModel } from './stores/apiKeyStore';
 import {
@@ -56,15 +63,19 @@ import {
   selectActiveTabId,
   selectShowWelcome,
   selectTabs,
-  selectWorkingDirectory,
 } from './stores/workspaceSelectors';
 import { useWorkspaceStore, getWorkspaceState } from './stores/workspaceStore';
 import { getProjectStore, useProjectStore, getRenderTargetContent } from './stores/projectStore';
 import { requestRender } from './stores/renderRequestStore';
-import { DEFAULT_TAB_NAME, DEFAULT_OPENSCAD_CODE } from './stores/workspaceFactories';
+import {
+  createSourceHash,
+  getRenderArtifactState,
+  useRenderArtifactStore,
+} from './stores/renderArtifactStore';
+import { DEFAULT_TAB_NAME } from './stores/workspaceFactories';
 import { formatOpenScadCode } from './utils/formatter';
-import { addRecentFile, addRecentFolder, removeRecentFile } from './utils/recentFiles';
-import { captureCurrentPreview } from './utils/capturePreview';
+import { addRecentFile, removeRecentFile } from './utils/recentFiles';
+import { captureCurrentPreview, MAIN_PREVIEW_VIEWER_ID } from './utils/capturePreview';
 import { normalizeAppError, notifyError, notifySuccess } from './utils/notifications';
 import { exportProjectZip } from './utils/projectZip';
 import { getRelativeProjectPath } from './utils/projectFilePaths';
@@ -77,7 +88,6 @@ import type { WorkspaceTab as WorkspaceDocumentTab } from './stores/workspaceTyp
 import {
   OPENSCAD_PROJECT_FILE_EXTENSIONS,
   isOpenScadProjectFilePath,
-  isRenderableOpenScadFilePath,
   pickOpenScadRenderTarget,
 } from '../../../packages/shared/src/openscadProjectFiles';
 
@@ -95,7 +105,6 @@ type MacArch = 'aarch64' | 'x64';
 const OPENSCAD_FILE_FILTERS = [
   { name: 'OpenSCAD Files', extensions: [...OPENSCAD_PROJECT_FILE_EXTENSIONS] },
 ];
-
 /** Prompt the user to pick a folder and return its project files, or null if cancelled. */
 function pickFolder(): Promise<{ files: Record<string, string>; renderTargetPath: string } | null> {
   return new Promise((resolve) => {
@@ -110,19 +119,21 @@ function pickFolder(): Promise<{ files: Record<string, string>; renderTargetPath
       }
 
       const files: Record<string, string> = {};
+      let workspaceName: string | null = null;
       for (const file of Array.from(fileList)) {
         // webkitRelativePath gives "folderName/path/to/file.scad"
         const relativePath = file.webkitRelativePath;
         if (!isOpenScadProjectFilePath(relativePath)) continue;
         // Strip the top-level folder name
         const parts = relativePath.split('/');
+        workspaceName ??= parts[0] || null;
         const pathWithoutRoot = parts.slice(1).join('/');
         if (pathWithoutRoot) {
           files[pathWithoutRoot] = await file.text();
         }
       }
 
-      const renderTargetPath = pickOpenScadRenderTarget(Object.keys(files));
+      const renderTargetPath = pickOpenScadRenderTarget(Object.keys(files), null, workspaceName);
       if (!renderTargetPath) {
         resolve(null);
         return;
@@ -255,17 +266,6 @@ function resolvePathConflict(candidatePath: string, existing: Set<string>): stri
   return `${stem}_${i}${ext}`;
 }
 
-/**
- * Given all subdirectory paths and all file paths in a project,
- * return the directories that have no file descendants (empty folders).
- */
-function findEmptyFolders(allDirs: string[], filePaths: string[]): string[] {
-  return allDirs.filter((dir) => {
-    const prefix = dir + '/';
-    return !filePaths.some((f) => f.startsWith(prefix));
-  });
-}
-
 function App() {
   const { isMobile } = useMobileLayout();
   const [isHeaderWorkspaceSwitcherHidden, setIsHeaderWorkspaceSwitcherHidden] = useState(
@@ -282,15 +282,17 @@ function App() {
   // The render target tab holds the preview — use its render state regardless of
   // which tab is currently active in the editor.
   const renderTargetPath = useProjectStore((s) => s.renderTargetPath);
+  const projectRoot = useProjectStore((s) => s.projectRoot);
   const renderTargetTab = tabs.find((t) => t.projectPath === renderTargetPath);
   const renderTargetRender = renderTargetTab?.render ?? activeRender;
-  const workingDir = useWorkspaceStore(selectWorkingDirectory);
+  const activeRenderArtifact = useRenderArtifactStore((state) =>
+    renderTargetPath ? (state.artifactsByTarget[renderTargetPath] ?? null) : null
+  );
   const createTab = useWorkspaceStore((state) => state.createTab);
   const setActiveTab = useWorkspaceStore((state) => state.setActiveTab);
   const markTabSaved = useWorkspaceStore((state) => state.markTabSaved);
   const renameTab = useWorkspaceStore((state) => state.renameTab);
   const closeTabLocal = useWorkspaceStore((state) => state.closeTabLocal);
-  const replaceWelcomeTab = useWorkspaceStore((state) => state.replaceWelcomeTab);
   const openSharedDocument = useWorkspaceStore((state) => state.openSharedDocument);
   const reorderWorkspaceTabs = useWorkspaceStore((state) => state.reorderTabs);
   const beginTabRender = useWorkspaceStore((state) => state.beginTabRender);
@@ -345,6 +347,24 @@ function App() {
   }, [capabilities.hasFileSystem, settings.project.defaultProjectDirectory]);
 
   useEffect(() => {
+    if (!capabilities.hasFileSystem) return;
+
+    let disposed = false;
+    void syncDesktopMcpConfig({
+      enabled: settings.mcp.enabled,
+      port: settings.mcp.port,
+    }).catch((error) => {
+      if (!disposed) {
+        console.error('[App] Failed to sync MCP config:', error);
+      }
+    });
+
+    return () => {
+      disposed = true;
+    };
+  }, [capabilities.hasFileSystem, settings.mcp.enabled, settings.mcp.port]);
+
+  useEffect(() => {
     const mq = window.matchMedia(HEADER_WORKSPACE_SWITCHER_MEDIA_QUERY);
     const handleChange = (event: MediaQueryListEvent) => {
       setIsHeaderWorkspaceSwitcherHidden(event.matches);
@@ -373,7 +393,7 @@ function App() {
     source: renderTargetContent,
     contentVersion,
     suppressInitialRender: Boolean(initialShareContext) || showWelcome,
-    workingDir,
+    workingDir: projectRoot,
     autoRenderOnIdle: settings.editor.autoRenderOnIdle,
     autoRenderDelayMs: settings.editor.autoRenderDelayMs,
     library: settings.library,
@@ -387,14 +407,47 @@ function App() {
       }
 
       const tab = rtTab ?? activeTabRef.current;
+      const requestId = beginTabRender(tabId, {
+        preferredDimension: tab?.render.dimensionMode,
+      });
+      const targetPath = rtPath ?? tab?.projectPath ?? activeTabRef.current.projectPath;
+      const currentProjectRoot = getProjectStore().getState().projectRoot;
+
+      getRenderArtifactState().setActiveRenderTarget(targetPath, currentProjectRoot);
+      notifyDesktopMcpRenderStarted({
+        renderTargetPath: targetPath,
+        requestId,
+      });
+
       return {
         tabId,
-        requestId: beginTabRender(tabId, {
-          preferredDimension: tab?.render.dimensionMode,
-        }),
+        requestId,
       };
     },
     onRenderSettled: ({ owner, code, snapshot }) => {
+      const settledRenderTargetPath =
+        getProjectStore().getState().renderTargetPath ??
+        (owner
+          ? (getWorkspaceState().tabs.find((tab) => tab.id === owner.tabId)?.projectPath ?? null)
+          : null);
+      if (owner && settledRenderTargetPath) {
+        getRenderArtifactState().publishSettledArtifact({
+          requestId: owner.requestId,
+          renderTargetPath: settledRenderTargetPath,
+          workspaceRoot: getProjectStore().getState().projectRoot,
+          sourceHash: createSourceHash(code),
+          previewKind: snapshot.previewKind,
+          previewSrc: snapshot.previewSrc,
+          diagnostics: snapshot.diagnostics,
+          error: snapshot.error,
+          dimensionMode: snapshot.dimensionMode,
+          sceneStyle: previewSceneStyle,
+          useModelColors: settings.viewer.showModelColors,
+          createdAt: Date.now(),
+        });
+      }
+      notifyDesktopMcpRenderSettled(owner?.requestId ?? null);
+
       if (!owner) {
         return;
       }
@@ -426,10 +479,12 @@ function App() {
       });
     },
   });
-  const activePreviewSrc = renderTargetRender?.previewSrc ?? '';
-  const activePreviewKind = renderTargetRender?.previewKind ?? previewKind;
-  const activeDiagnostics = renderTargetRender?.diagnostics ?? diagnostics;
-  const activeError = renderTargetRender?.error ?? error;
+  const activePreviewSrc = activeRenderArtifact?.previewSrc ?? renderTargetRender?.previewSrc ?? '';
+  const activePreviewKind =
+    activeRenderArtifact?.previewKind ?? renderTargetRender?.previewKind ?? previewKind;
+  const activeDiagnostics =
+    activeRenderArtifact?.diagnostics ?? renderTargetRender?.diagnostics ?? diagnostics;
+  const activeError = activeRenderArtifact?.error ?? renderTargetRender?.error ?? error;
 
   const handleOpenFallbackEditor = useCallback(() => {
     setShowNux(false);
@@ -441,62 +496,30 @@ function App() {
     }
   }, [renderTargetRender?.lastRenderedContent, hideWelcomeScreen, ready]);
 
-  // Project initialization helper
-  // Populates the projectStore when a file is opened on either platform.
+  useEffect(() => {
+    getRenderArtifactState().setActiveRenderTarget(renderTargetPath ?? null, projectRoot);
+  }, [projectRoot, renderTargetPath]);
+
   const initializeProject = useCallback(
     async (filePath: string | null, fileName: string, content: string) => {
-      const store = getProjectStore();
-      const platform = getPlatform();
-
-      if (filePath) {
-        // Desktop: derive project root from file path and scan for siblings
-        const separatorIndex = filePath.lastIndexOf('/');
-        const projectRoot = separatorIndex > 0 ? filePath.substring(0, separatorIndex) : null;
-        const relativeName = filePath.substring(separatorIndex + 1);
-
-        const files: Record<string, string> = { [relativeName]: content };
-
-        if (projectRoot && platform.capabilities.hasFileSystem) {
-          try {
-            const siblings = await platform.readDirectoryFiles(
-              projectRoot,
-              [...OPENSCAD_PROJECT_FILE_EXTENSIONS],
-              true
-            );
-            for (const [relPath, siblingContent] of Object.entries(siblings)) {
-              // Don't overwrite the primary file (we have the freshest content)
-              if (relPath !== relativeName) {
-                files[relPath] = siblingContent;
-              }
-            }
-          } catch (err) {
-            console.warn('[App] Failed to scan sibling files:', err);
-          }
-        }
-
-        const renderTarget =
-          pickOpenScadRenderTarget(
-            Object.keys(files),
-            isRenderableOpenScadFilePath(relativeName) ? relativeName : null
-          ) ?? relativeName;
-
-        store.getState().openProject(projectRoot, files, renderTarget);
-
-        // Discover empty folders on disk
-        if (projectRoot && platform.capabilities.hasFileSystem) {
-          try {
-            const allDirs = await platform.readSubdirectories(projectRoot);
-            const empty = findEmptyFolders(allDirs, Object.keys(files));
-            for (const dir of empty) store.getState().addFolder(dir);
-          } catch {
-            // Non-critical — empty folders just won't appear
-          }
-        }
-      } else {
-        // Web: single file project with no disk root
+      if (!filePath) {
         const name = fileName || DEFAULT_TAB_NAME;
-        store.getState().openProject(null, { [name]: content }, name);
+        getProjectStore()
+          .getState()
+          .openProject(null, { [name]: content }, name);
+        return;
       }
+
+      await openFileInWindow(
+        {
+          path: filePath,
+          name: fileName || DEFAULT_TAB_NAME,
+          content,
+        },
+        {
+          trackRecent: true,
+        }
+      );
     },
     []
   );
@@ -1049,9 +1072,11 @@ function App() {
     if (Object.keys(state.files).length === 0) {
       const tab = activeTabRef.current;
       const defaultContent = '// Type your OpenSCAD code here\ncube([10, 10, 10]);';
-      void initializeProject(tab.filePath, tab.name, defaultContent);
+      // Seed the untitled web project without hydrating workspace state.
+      // Explicit file/folder opens should transition out of welcome, but the
+      // initial empty project should stay behind the welcome screen.
+      state.openProject(null, { [tab.name]: defaultContent }, tab.name);
     }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Keep refs in sync with state
@@ -1069,6 +1094,7 @@ function App() {
   useEffect(() => {
     updateCapturePreview(() =>
       captureCurrentPreview({
+        viewerId: MAIN_PREVIEW_VIEWER_ID,
         svgSourceUrl: activePreviewKind === 'svg' ? activePreviewSrc : null,
         targetWidth: 1200,
         targetHeight: 630,
@@ -1346,26 +1372,7 @@ function App() {
     let dirPath: string | null;
 
     if (hasCustomProjectDir) {
-      // User explicitly chose this directory — use it directly, loading existing files
-      await platform.createDirectory(resolvedProjectDir);
       dirPath = resolvedProjectDir;
-
-      const diskFiles = await platform.readDirectoryFiles(
-        dirPath,
-        [...OPENSCAD_PROJECT_FILE_EXTENSIONS],
-        true
-      );
-      const renderTarget = pickOpenScadRenderTarget(Object.keys(diskFiles));
-
-      if (renderTarget) {
-        // Folder has existing renderable OpenSCAD files — open as project
-        getProjectStore().getState().openProject(dirPath, diskFiles, renderTarget);
-      } else {
-        // Empty folder — create a default main.scad
-        const files = { [DEFAULT_TAB_NAME]: DEFAULT_OPENSCAD_CODE };
-        getProjectStore().getState().openProject(dirPath, files, DEFAULT_TAB_NAME);
-        await platform.writeTextFile(`${dirPath}/${DEFAULT_TAB_NAME}`, DEFAULT_OPENSCAD_CODE);
-      }
     } else {
       // Default base dir — create a random-named subdirectory
       dirPath = await platform.createProjectDirectory(resolvedProjectDir, pendingProjectName);
@@ -1373,43 +1380,15 @@ function App() {
       setPendingProjectName(generateRandomProjectName());
 
       if (!dirPath) return null;
-
-      // Write default main.scad to disk
-      const files = { [DEFAULT_TAB_NAME]: DEFAULT_OPENSCAD_CODE };
-      getProjectStore().getState().openProject(dirPath, files, DEFAULT_TAB_NAME);
-      await platform.writeTextFile(`${dirPath}/${DEFAULT_TAB_NAME}`, DEFAULT_OPENSCAD_CODE);
     }
     if (!dirPath) return null;
 
-    // Update the welcome tab with real file path
-    const renderTarget = getProjectStore().getState().renderTargetPath || DEFAULT_TAB_NAME;
-    const firstTab = getWorkspaceState().tabs[0];
-    if (firstTab) {
-      replaceWelcomeTab({
-        filePath: `${dirPath}/${renderTarget}`,
-        name: renderTarget.split('/').pop() || renderTarget,
-        projectPath: renderTarget,
-      });
-    }
-
-    addRecentFolder(dirPath);
-
-    // Notify the editor to sync its model with the new content.
-    // This handles the case where the Monaco model was created before
-    // openProject updated the store (e.g. "Start in folder" with existing files).
-    const finalContent = getProjectStore().getState().files[renderTarget]?.content;
-    if (finalContent) {
-      eventBus.emit('code-updated', { code: finalContent, source: 'file-open' });
-    }
+    await openWorkspaceFolderInWindow(dirPath, {
+      createIfEmpty: true,
+    });
 
     return dirPath;
-  }, [
-    capabilities.hasFileSystem,
-    resolvedProjectDir,
-    pendingProjectName,
-    hasCustomProjectDir,
-    replaceWelcomeTab,
-  ]);
+  }, [capabilities.hasFileSystem, resolvedProjectDir, pendingProjectName, hasCustomProjectDir]);
 
   const handleStartWithDraft = useCallback(
     (draftOverride?: AiDraft) => {
@@ -1428,9 +1407,7 @@ function App() {
 
   const handleStartManually = useCallback(() => {
     hideWelcomeScreen();
-    void initProjectDirectory().then(() => {
-      requestRender('file_open', { immediate: true });
-    });
+    void initProjectDirectory();
   }, [hideWelcomeScreen, initProjectDirectory]);
 
   const handleChangeProjectDirectory = useCallback(async () => {
@@ -1441,6 +1418,64 @@ function App() {
       setHasEphemeralProjectDir(true);
     }
   }, []);
+
+  const openWorkspaceFolderInCurrentWindow = useCallback(
+    async (
+      dirPath: string,
+      options: {
+        createIfEmpty?: boolean;
+        source?: 'recent' | 'menu_open';
+      } = {}
+    ) => {
+      setIsProjectLoading(true);
+      try {
+        const result = await openWorkspaceFolderInWindow(dirPath, {
+          createIfEmpty: options.createIfEmpty,
+        });
+
+        if (options.source) {
+          analytics.track('folder opened', {
+            source: options.source,
+            file_count: result.fileCount,
+            created_default_file: result.createdDefaultFile,
+          });
+        }
+
+        return result;
+      } finally {
+        setIsProjectLoading(false);
+      }
+    },
+    [analytics]
+  );
+
+  const openFileInCurrentWindow = useCallback(
+    async (
+      result: { path: string | null; name: string; content: string },
+      options: {
+        source?: 'open' | 'menu_open' | 'recent';
+      } = {}
+    ) => {
+      setIsProjectLoading(true);
+      try {
+        const openResult = await openFileInWindow(result);
+
+        if (options.source) {
+          analytics.track('file opened', {
+            source: options.source,
+            has_disk_path: Boolean(result.path),
+            reused_existing_tab: openResult.reusedExistingTab,
+            replaced_welcome_tab: !openResult.reusedExistingTab,
+          });
+        }
+
+        return openResult;
+      } finally {
+        setIsProjectLoading(false);
+      }
+    },
+    [analytics]
+  );
 
   const handleNuxSelect = useCallback(
     (preset: 'default' | 'ai-first' | 'customizer-first') => {
@@ -1548,46 +1583,7 @@ function App() {
         if (type === 'folder' || !isOpenScadProjectFilePath(path)) {
           const platform = getPlatform();
           if (!platform.capabilities.hasFileSystem) return 'cancelled' as const;
-
-          const files = await platform.readDirectoryFiles(
-            path,
-            [...OPENSCAD_PROJECT_FILE_EXTENSIONS],
-            true
-          );
-          const renderTarget = pickOpenScadRenderTarget(Object.keys(files));
-          if (!renderTarget) return 'removed' as const;
-
-          getProjectStore().getState().openProject(path, files, renderTarget);
-
-          // Discover empty folders
-          try {
-            const allDirs = await platform.readSubdirectories(path);
-            const empty = findEmptyFolders(allDirs, Object.keys(files));
-            for (const dir of empty) getProjectStore().getState().addFolder(dir);
-          } catch {
-            // Non-critical
-          }
-
-          const firstTab = tabs[0];
-          const shouldReplace = firstTab && !firstTab.filePath && tabs.length === 1;
-          if (shouldReplace) {
-            revokeBlobUrl(firstTab.render.previewSrc);
-            replaceWelcomeTab({
-              filePath: `${path}/${renderTarget}`,
-              name: renderTarget,
-              projectPath: renderTarget,
-            });
-          } else {
-            createNewTab(`${path}/${renderTarget}`, files[renderTarget], renderTarget);
-          }
-          hideWelcomeScreen();
-          addRecentFolder(path);
-          analytics.track('folder opened', {
-            source: 'recent',
-            file_count: Object.keys(files).length,
-          });
-
-          requestRender('file_open', { immediate: true });
+          await openWorkspaceFolderInCurrentWindow(path, { source: 'recent' });
           return 'opened' as const;
         }
 
@@ -1619,36 +1615,7 @@ function App() {
         const result = await platform.fileRead(path);
         if (!result) return 'cancelled' as const;
 
-        setIsProjectLoading(true);
-        // Initialize project store and wait for all sibling files to load
-        // before proceeding — otherwise the render fires with missing includes
-        await initializeProject(result.path, result.name, result.content);
-
-        const firstTab = tabs[0];
-        const shouldReplaceFirstTab = showWelcome && tabs.length === 1 && !firstTab.filePath;
-
-        if (shouldReplaceFirstTab) {
-          revokeBlobUrl(firstTab.render.previewSrc);
-          replaceWelcomeTab({
-            filePath: result.path,
-            name: result.name,
-            projectPath: result.name,
-          });
-        } else {
-          createNewTab(result.path, result.content, result.name);
-        }
-
-        hideWelcomeScreen();
-        setIsProjectLoading(false);
-        if (result.path) addRecentFile(result.path);
-        analytics.track('file opened', {
-          source: 'recent',
-          has_disk_path: Boolean(result.path),
-          reused_existing_tab: false,
-          replaced_welcome_tab: shouldReplaceFirstTab,
-        });
-
-        requestRender('file_open', { immediate: true });
+        await openFileInCurrentWindow(result, { source: 'recent' });
         return 'opened' as const;
       } catch (err) {
         removeRecentFile(path);
@@ -1671,11 +1638,9 @@ function App() {
     },
     [
       analytics,
-      createNewTab,
       hideWelcomeScreen,
-      initializeProject,
-      replaceWelcomeTab,
-      showWelcome,
+      openWorkspaceFolderInCurrentWindow,
+      openFileInCurrentWindow,
       switchTab,
       tabs,
     ]
@@ -1685,54 +1650,7 @@ function App() {
     try {
       const result = await getPlatform().fileOpen(OPENSCAD_FILE_FILTERS);
       if (!result) return;
-
-      if (result.path) {
-        const existingTab = tabs.find((t) => t.filePath === result.path);
-        if (existingTab) {
-          await switchTab(existingTab.id);
-          hideWelcomeScreen();
-          analytics.track('file opened', {
-            source: 'open',
-            has_disk_path: true,
-            reused_existing_tab: true,
-            replaced_welcome_tab: false,
-          });
-          return;
-        }
-      }
-
-      // Show the rendering spinner while project files load from disk
-      setIsProjectLoading(true);
-
-      // Initialize project store and wait for all sibling files to load
-      // before proceeding — otherwise the render fires with missing includes
-      await initializeProject(result.path, result.name, result.content);
-
-      const firstTab = tabs[0];
-      const shouldReplaceFirstTab = showWelcome && tabs.length === 1 && !firstTab.filePath;
-
-      if (shouldReplaceFirstTab) {
-        revokeBlobUrl(firstTab.render.previewSrc);
-        replaceWelcomeTab({
-          filePath: result.path,
-          name: result.name,
-          projectPath: result.name,
-        });
-      } else {
-        createNewTab(result.path, result.content, result.name);
-      }
-
-      hideWelcomeScreen();
-      setIsProjectLoading(false);
-      if (result.path) addRecentFile(result.path);
-      analytics.track('file opened', {
-        source: 'open',
-        has_disk_path: Boolean(result.path),
-        reused_existing_tab: false,
-        replaced_welcome_tab: shouldReplaceFirstTab,
-      });
-
-      requestRender('file_open', { immediate: true });
+      await openFileInCurrentWindow(result, { source: 'open' });
     } catch (err) {
       notifyError({
         operation: 'open-file',
@@ -1742,16 +1660,7 @@ function App() {
         logLabel: 'Failed to open file',
       });
     }
-  }, [
-    analytics,
-    createNewTab,
-    hideWelcomeScreen,
-    initializeProject,
-    replaceWelcomeTab,
-    showWelcome,
-    switchTab,
-    tabs,
-  ]);
+  }, [openFileInCurrentWindow]);
 
   // Helper function to check for unsaved changes before destructive operations
   // Returns: true if ok to proceed, false if user wants to cancel
@@ -1811,38 +1720,7 @@ function App() {
         try {
           const result = await getPlatform().fileOpen(OPENSCAD_FILE_FILTERS);
           if (!result) return;
-
-          if (result.path) {
-            const existingTab = tabsRef.current.find((t) => t.filePath === result.path);
-            if (existingTab) {
-              await switchTab(existingTab.id);
-              hideWelcomeScreen();
-              analytics.track('file opened', {
-                source: 'menu_open',
-                has_disk_path: true,
-                reused_existing_tab: true,
-                replaced_welcome_tab: false,
-              });
-              return;
-            }
-          }
-
-          setIsProjectLoading(true);
-          // Initialize project store and wait for all sibling files to load
-          await initializeProject(result.path, result.name, result.content);
-          createNewTab(result.path, result.content, result.name);
-          hideWelcomeScreen();
-          setIsProjectLoading(false);
-
-          if (result.path) addRecentFile(result.path);
-          analytics.track('file opened', {
-            source: 'menu_open',
-            has_disk_path: Boolean(result.path),
-            reused_existing_tab: false,
-            replaced_welcome_tab: false,
-          });
-
-          requestRender('file_open', { immediate: true });
+          await openFileInCurrentWindow(result, { source: 'menu_open' });
         } catch (err) {
           notifyError({
             operation: 'open-file',
@@ -1866,53 +1744,7 @@ function App() {
           const platform = getPlatform();
           const dirPath = await platform.pickDirectory();
           if (!dirPath) return;
-
-          const files = await platform.readDirectoryFiles(
-            dirPath,
-            [...OPENSCAD_PROJECT_FILE_EXTENSIONS],
-            true
-          );
-          const renderTarget = pickOpenScadRenderTarget(Object.keys(files));
-          if (!renderTarget) {
-            notifyError({
-              operation: 'open-folder',
-              error: new Error('No renderable .scad files found'),
-              fallbackMessage: 'No renderable .scad files found in the selected folder',
-              toastId: 'open-folder-empty',
-              logLabel: 'Open folder empty',
-            });
-            return;
-          }
-
-          getProjectStore().getState().openProject(dirPath, files, renderTarget);
-
-          // Discover empty folders
-          try {
-            const allDirs = await platform.readSubdirectories(dirPath);
-            const empty = findEmptyFolders(allDirs, Object.keys(files));
-            for (const dir of empty) getProjectStore().getState().addFolder(dir);
-          } catch {
-            // Non-critical
-          }
-
-          const firstTab = tabsRef.current[0];
-          const shouldReplace = firstTab && !firstTab.filePath && tabsRef.current.length === 1;
-          if (shouldReplace) {
-            revokeBlobUrl(firstTab.render.previewSrc);
-            replaceWelcomeTab({
-              filePath: `${dirPath}/${renderTarget}`,
-              name: renderTarget,
-              projectPath: renderTarget,
-            });
-          } else {
-            createNewTab(`${dirPath}/${renderTarget}`, files[renderTarget], renderTarget);
-          }
-          hideWelcomeScreen();
-          addRecentFolder(dirPath);
-
-          analytics.track('folder opened', { file_count: Object.keys(files).length });
-
-          requestRender('file_open', { immediate: true });
+          await openWorkspaceFolderInCurrentWindow(dirPath, { source: 'menu_open' });
         } catch (err) {
           notifyError({
             operation: 'open-folder',
@@ -2052,11 +1884,10 @@ function App() {
     analytics,
     createNewTab,
     hideWelcomeScreen,
-    initializeProject,
+    openFileInCurrentWindow,
+    openWorkspaceFolderInCurrentWindow,
     saveAllFiles,
-    showWelcome,
     showWelcomeScreen,
-    switchTab,
   ]);
 
   useEffect(() => {
@@ -2077,10 +1908,35 @@ function App() {
   const anyFileDirty = useProjectStore((s) => Object.values(s.files).some((f) => f.isDirty));
 
   useEffect(() => {
-    const fileName = activeTab.name;
+    const workspaceName = projectRoot
+      ? (projectRoot.split('/').filter(Boolean).pop() ?? activeTab.name)
+      : activeTab.filePath
+        ? activeTab.name
+        : 'Untitled Project';
     const dirtyIndicator = activeFileDirty ? '\u2022 ' : '';
-    getPlatform().setWindowTitle(`${dirtyIndicator}${fileName} - OpenSCAD Studio`);
-  }, [activeTab.name, activeFileDirty]);
+    const title = `${dirtyIndicator}${workspaceName} - OpenSCAD Studio`;
+    getPlatform().setWindowTitle(title);
+
+    if (capabilities.hasFileSystem) {
+      void syncDesktopMcpWindowContext({
+        title,
+        workspaceRoot: projectRoot,
+        renderTargetPath,
+        showWelcome,
+        mode: showWelcome ? 'welcome' : 'ready',
+      }).catch((error) => {
+        console.error('[App] Failed to sync MCP window context:', error);
+      });
+    }
+  }, [
+    activeFileDirty,
+    activeTab.filePath,
+    activeTab.name,
+    capabilities.hasFileSystem,
+    projectRoot,
+    renderTargetPath,
+    showWelcome,
+  ]);
 
   useEffect(() => {
     const platform = getPlatform();
@@ -2090,7 +1946,6 @@ function App() {
   }, [anyFileDirty]);
 
   // Watch project directory for external file changes (desktop only)
-  const projectRoot = useProjectStore((s) => s.projectRoot);
   useEffect(() => {
     if (!projectRoot) return;
     const platform = getPlatform();
@@ -2700,7 +2555,7 @@ function App() {
         isOpen={showExportDialog}
         onClose={() => setShowExportDialog(false)}
         source={renderTargetContent}
-        workingDir={workingDir}
+        workingDir={projectRoot}
         previewKind={activePreviewKind}
       />
       <ShareDialog
@@ -2711,6 +2566,7 @@ function App() {
         forkedFrom={shareOrigin?.shareId ?? null}
         capturePreview={() =>
           captureCurrentPreview({
+            viewerId: MAIN_PREVIEW_VIEWER_ID,
             svgSourceUrl: activePreviewKind === 'svg' ? activePreviewSrc : null,
             targetWidth: 1200,
             targetHeight: 630,

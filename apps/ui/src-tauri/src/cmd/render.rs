@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::fs;
 use std::hash::{Hash, Hasher};
 use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
@@ -249,6 +249,108 @@ struct RenderWorkspace {
     project_temp_files: Vec<PathBuf>,
 }
 
+fn normalize_relative_project_path(path: &str) -> Result<PathBuf, String> {
+    let sanitized = path.trim().replace('\\', "/");
+    if sanitized.is_empty() {
+        return Ok(PathBuf::from("input.scad"));
+    }
+
+    let candidate = Path::new(&sanitized);
+    let mut normalized = PathBuf::new();
+
+    for component in candidate.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(part) => normalized.push(part),
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(format!(
+                        "Render target path `{}` escapes the workspace root.",
+                        path
+                    ));
+                }
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(format!(
+                    "Render target path `{}` must be project-relative.",
+                    path
+                ));
+            }
+        }
+    }
+
+    if normalized.as_os_str().is_empty() {
+        Ok(PathBuf::from("input.scad"))
+    } else {
+        Ok(normalized)
+    }
+}
+
+fn collapse_duplicate_leading_segment(path: &Path) -> Option<PathBuf> {
+    let parts: Vec<_> = path
+        .components()
+        .filter_map(|component| match component {
+            Component::Normal(part) => Some(part.to_owned()),
+            _ => None,
+        })
+        .collect();
+
+    if parts.len() < 2 || parts[0] != parts[1] {
+        return None;
+    }
+
+    let mut collapsed = PathBuf::new();
+    collapsed.push(&parts[0]);
+    for part in parts.iter().skip(2) {
+        collapsed.push(part);
+    }
+    Some(collapsed)
+}
+
+fn resolve_project_relative_path(project_root: &Path, raw_path: &str) -> Result<PathBuf, String> {
+    let sanitized = raw_path.trim().replace('\\', "/");
+    let raw_candidate = Path::new(&sanitized);
+
+    let normalized = if raw_candidate.is_absolute() {
+        let stripped = raw_candidate.strip_prefix(project_root).map_err(|_| {
+            format!(
+                "Render target path `{}` is outside the workspace root `{}`.",
+                raw_path,
+                project_root.display()
+            )
+        })?;
+        normalize_relative_project_path(&stripped.to_string_lossy())?
+    } else {
+        normalize_relative_project_path(&sanitized)?
+    };
+
+    let joined = project_root.join(&normalized);
+    let joined_parent_exists = joined
+        .parent()
+        .map(|parent| parent.exists())
+        .unwrap_or(false);
+    if joined.exists() || joined_parent_exists {
+        return Ok(normalized);
+    }
+
+    if let Some(collapsed) = collapse_duplicate_leading_segment(&normalized) {
+        let collapsed_joined = project_root.join(&collapsed);
+        let collapsed_parent_exists = collapsed_joined
+            .parent()
+            .map(|parent| parent.exists())
+            .unwrap_or(false);
+        if collapsed_joined.exists() || collapsed_parent_exists {
+            eprintln!(
+                "[render] Collapsing duplicated leading segment in project-relative path {:?} -> {:?}",
+                normalized, collapsed
+            );
+            return Ok(collapsed);
+        }
+    }
+
+    Ok(normalized)
+}
+
 /// Create workspace for a native render.
 ///
 /// When a `working_dir` (project root) is provided, the input file is written
@@ -279,11 +381,14 @@ fn create_render_workspace(
         // Write the input file into the project directory so all relative
         // paths (import, include, use) resolve against the real filesystem.
         let project_root = PathBuf::from(wd);
-        let relative_input = input_path.as_deref().unwrap_or("input.scad");
+        let relative_input = resolve_project_relative_path(
+            &project_root,
+            input_path.as_deref().unwrap_or("input.scad"),
+        )?;
 
         // Use a temp filename next to the real file to avoid overwriting it
         // (the editor content may have unsaved changes).
-        let real_path = project_root.join(relative_input);
+        let real_path = project_root.join(&relative_input);
         let parent = real_path.parent().unwrap_or(&project_root);
         let stem = real_path
             .file_stem()
@@ -325,7 +430,8 @@ fn create_render_workspace(
                 if is_library_file {
                     continue;
                 }
-                let real_aux = project_root.join(rel_path);
+                let normalized_rel_path = resolve_project_relative_path(&project_root, rel_path)?;
+                let real_aux = project_root.join(&normalized_rel_path);
                 // Check if the content differs from what's on disk
                 let disk_content = fs::read_to_string(&real_aux).unwrap_or_default();
                 if disk_content != *content {
@@ -594,5 +700,89 @@ fn tokio_timeout_wait(
             ))
         }
         Err(e) => Err(format!("Channel error waiting for OpenSCAD: {}", e)),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        create_render_workspace, normalize_relative_project_path, resolve_project_relative_path,
+    };
+    use std::fs;
+    use std::path::PathBuf;
+
+    fn create_temp_project_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join("openscad-studio-render-tests")
+            .join(format!("{name}-{}", uuid::Uuid::new_v4()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn normalize_relative_project_path_rejects_workspace_escape() {
+        let error = normalize_relative_project_path("../config.scad").unwrap_err();
+        assert!(error.contains("escapes the workspace root"));
+    }
+
+    #[test]
+    fn resolve_project_relative_path_keeps_valid_nested_target() {
+        let project_root = create_temp_project_dir("nested-target");
+        let nested_dir = project_root.join("openscad");
+        fs::create_dir_all(&nested_dir).unwrap();
+
+        let resolved =
+            resolve_project_relative_path(&project_root, "openscad/poly555.scad").unwrap();
+
+        assert_eq!(resolved, PathBuf::from("openscad/poly555.scad"));
+
+        let _ = fs::remove_dir_all(project_root);
+    }
+
+    #[test]
+    fn resolve_project_relative_path_collapses_duplicate_leading_segment_when_needed() {
+        let project_root = create_temp_project_dir("duplicate-segment");
+        let nested_dir = project_root.join("openscad");
+        fs::create_dir_all(&nested_dir).unwrap();
+
+        let resolved =
+            resolve_project_relative_path(&project_root, "openscad/openscad/poly555.scad").unwrap();
+
+        assert_eq!(resolved, PathBuf::from("openscad/poly555.scad"));
+
+        let _ = fs::remove_dir_all(project_root);
+    }
+
+    #[test]
+    fn create_render_workspace_places_nested_temp_input_beside_real_target() {
+        let project_root = create_temp_project_dir("workspace-input");
+        let nested_dir = project_root.join("openscad");
+        fs::create_dir_all(&nested_dir).unwrap();
+
+        let workspace = create_render_workspace(
+            "cube(10);",
+            "output.off",
+            &None,
+            &Some("openscad/poly555.scad".into()),
+            &Some(project_root.to_string_lossy().to_string()),
+            &None,
+        )
+        .unwrap();
+
+        assert_eq!(workspace.input_path.parent(), Some(nested_dir.as_path()));
+        assert_eq!(
+            workspace
+                .input_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.starts_with(".openscad-studio-poly555-")),
+            Some(true)
+        );
+
+        for temp_file in workspace.project_temp_files {
+            let _ = fs::remove_file(temp_file);
+        }
+        let _ = fs::remove_dir_all(workspace.temp_dir);
+        let _ = fs::remove_dir_all(project_root);
     }
 }

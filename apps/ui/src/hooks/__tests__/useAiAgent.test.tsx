@@ -106,6 +106,17 @@ describe('useAiAgent', () => {
           listProjectFiles: () => string[];
           readProjectFile: (path: string) => string | null;
           getRenderTargetPath: () => string | null;
+          getRenderValidationInputs: () => Promise<{
+            code: string;
+            renderTargetPath: string | null;
+            renderOptions: {
+              auxiliaryFiles?: Record<string, string>;
+              inputPath?: string;
+              libraryFiles?: Record<string, string>;
+              libraryPaths?: string[];
+              workingDir?: string;
+            };
+          }>;
           createProjectFile: (path: string, content: string) => boolean;
           editProjectFile: (path: string, oldString: string, newString: string) => string | null;
           setRenderTarget: (path: string) => boolean;
@@ -151,6 +162,20 @@ describe('useAiAgent', () => {
     );
     expect(capturedCallbacks!.readProjectFile('../escape.scad')).toBeNull();
     expect(capturedCallbacks!.getRenderTargetPath()).toBe('main.scad');
+    await expect(capturedCallbacks!.getRenderValidationInputs()).resolves.toEqual({
+      code: 'use <lib/constants.h>\ncube(42);',
+      renderTargetPath: 'main.scad',
+      renderOptions: {
+        auxiliaryFiles: {
+          'lib/constants.h': 'wall = 2;',
+          'lib/utils.scad': 'module helper() {}',
+        },
+        inputPath: 'main.scad',
+        libraryFiles: undefined,
+        libraryPaths: undefined,
+        workingDir: undefined,
+      },
+    });
     expect(capturedCallbacks!.getMeasurementUnit()).toBe('cm');
 
     // Test editProjectFile

@@ -15,6 +15,7 @@ import { isExportValidationError } from '../../services/exportErrors';
 import { getRenderService } from '../../services/renderService';
 import { getPlatform } from '../../platform';
 import { notifyError } from '../../utils/notifications';
+import { MAIN_PREVIEW_VIEWER_ID } from '../../utils/capturePreview';
 import { useAnalytics } from '../../analytics/runtime';
 
 const EditorPanel: React.FC<IDockviewPanelProps> = () => {
@@ -58,7 +59,6 @@ const EditorPanel: React.FC<IDockviewPanelProps> = () => {
 
 const PreviewPanel: React.FC<IDockviewPanelProps> = () => {
   const {
-    activeTabId,
     previewSrc,
     previewKind,
     isRendering,
@@ -75,7 +75,7 @@ const PreviewPanel: React.FC<IDockviewPanelProps> = () => {
         kind={previewKind}
         isRendering={isRendering}
         error={error}
-        viewerId={activeTabId}
+        viewerId={MAIN_PREVIEW_VIEWER_ID}
         onVisualReady={onPreviewVisualReady}
         hasCurrentModelApiKey={hasCurrentModelApiKey}
         canAttachViewerAnnotation={canAttachViewerAnnotation}

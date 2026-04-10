@@ -73,6 +73,35 @@ describe('platform bootstrap', () => {
     jest.unstable_mockModule('@tauri-apps/api/event', () => ({
       listen,
     }));
+    const onFocusChanged = jest.fn(async () => jest.fn());
+    jest.unstable_mockModule('@tauri-apps/api/window', () => ({
+      getCurrentWindow: () => ({
+        onFocusChanged,
+        setTitle: jest.fn(),
+      }),
+    }));
+    jest.unstable_mockModule('@tauri-apps/api/path', () => ({
+      homeDir: jest.fn(),
+      join: jest.fn(),
+      documentDir: jest.fn(),
+    }));
+    jest.unstable_mockModule('@tauri-apps/plugin-dialog', () => ({
+      open: jest.fn(),
+      save: jest.fn(),
+      confirm: jest.fn(),
+      ask: jest.fn(),
+    }));
+    jest.unstable_mockModule('@tauri-apps/plugin-fs', () => ({
+      readTextFile: jest.fn(),
+      writeTextFile: jest.fn(),
+      writeFile: jest.fn(),
+      readDir: jest.fn(),
+      exists: jest.fn(),
+      mkdir: jest.fn(),
+      remove: jest.fn(),
+      rename: jest.fn(),
+      watch: jest.fn(),
+    }));
 
     const platform = await import('../index');
     const initialized = await platform.initializePlatform();

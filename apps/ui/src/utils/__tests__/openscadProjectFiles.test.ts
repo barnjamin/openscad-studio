@@ -22,6 +22,36 @@ describe('openscadProjectFiles helpers', () => {
     );
   });
 
+  it('prefers a renderable file whose basename matches the workspace name', () => {
+    expect(
+      pickOpenScadRenderTarget(
+        ['openscad/config.scad', 'openscad/poly555.scad', 'z.scad'],
+        null,
+        'poly555'
+      )
+    ).toBe('openscad/poly555.scad');
+  });
+
+  it('breaks workspace-name matches by shallower path and then alphabetical order', () => {
+    expect(
+      pickOpenScadRenderTarget(
+        ['nested/deeper/poly555.scad', 'alpha/poly555.scad', 'beta/poly555.scad'],
+        null,
+        'poly555'
+      )
+    ).toBe('alpha/poly555.scad');
+  });
+
+  it('preserves the preferred render target when provided', () => {
+    expect(
+      pickOpenScadRenderTarget(
+        ['openscad/config.scad', 'openscad/poly555.scad'],
+        'openscad/config.scad',
+        'poly555'
+      )
+    ).toBe('openscad/config.scad');
+  });
+
   it('returns null when no renderable files exist', () => {
     expect(pickOpenScadRenderTarget(['lib/constants.h', 'params.h'])).toBeNull();
   });

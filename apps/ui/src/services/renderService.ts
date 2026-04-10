@@ -20,6 +20,13 @@ export interface Diagnostic {
 
 export type ExportFormat = 'stl' | 'obj' | 'amf' | '3mf' | 'svg' | 'dxf';
 
+export interface ExportOptions extends Pick<
+  RenderOptions,
+  'auxiliaryFiles' | 'inputPath' | 'workingDir' | 'libraryFiles' | 'libraryPaths'
+> {
+  backend?: 'manifold' | 'cgal' | 'auto';
+}
+
 export interface RenderOptions {
   view?: '2d' | '3d';
   backend?: 'manifold' | 'cgal' | 'auto';
@@ -193,12 +200,8 @@ export interface IRenderService {
   init(): Promise<void>;
   render(code: string, options?: RenderOptions): Promise<RenderResult>;
   getCached(code: string, options?: RenderOptions): Promise<RenderResult | null>;
-  exportModel(
-    code: string,
-    format: ExportFormat,
-    options?: { backend?: 'manifold' | 'cgal' | 'auto' }
-  ): Promise<Uint8Array>;
-  checkSyntax(code: string): Promise<SyntaxCheckResult>;
+  exportModel(code: string, format: ExportFormat, options?: ExportOptions): Promise<Uint8Array>;
+  checkSyntax(code: string, options?: RenderOptions): Promise<SyntaxCheckResult>;
   cancel(): void;
   clearCache(): void;
   dispose(): void;
@@ -443,9 +446,13 @@ export class WasmRenderService implements IRenderService {
   /**
    * Check syntax by attempting to render. Returns diagnostics only.
    */
-  async checkSyntax(code: string): Promise<SyntaxCheckResult> {
+  async checkSyntax(code: string, options: RenderOptions = {}): Promise<SyntaxCheckResult> {
     const args = this.buildArgs('/output.stl', { backend: 'manifold' });
-    const result = await this.sendRequest(code, args);
+    const allFiles =
+      options.libraryFiles || options.auxiliaryFiles
+        ? { ...(options.libraryFiles || {}), ...(options.auxiliaryFiles || {}) }
+        : undefined;
+    const result = await this.sendRequest(code, args, allFiles, options.inputPath);
     const diagnostics = parseOpenScadStderr(result.stderr);
 
     return { diagnostics };
@@ -457,18 +464,22 @@ export class WasmRenderService implements IRenderService {
   async exportModel(
     code: string,
     format: ExportFormat,
-    options: { backend?: 'manifold' | 'cgal' | 'auto' } = {}
+    options: ExportOptions = {}
   ): Promise<Uint8Array> {
     const { backend = 'manifold' } = options;
     const outputPath = `/output.${format}`;
     const args = this.buildArgs(outputPath, { backend });
+    const allFiles =
+      options.libraryFiles || options.auxiliaryFiles
+        ? { ...(options.libraryFiles || {}), ...(options.auxiliaryFiles || {}) }
+        : undefined;
 
     // For binary STL (more compact)
     if (format === 'stl') {
       args.push('--export-format=binstl');
     }
 
-    const result = await this.sendRequest(code, args);
+    const result = await this.sendRequest(code, args, allFiles, options.inputPath);
 
     if (result.output.length === 0) {
       const diagnostics = parseOpenScadStderr(result.stderr);

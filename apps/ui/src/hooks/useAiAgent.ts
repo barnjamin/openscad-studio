@@ -15,6 +15,10 @@ import {
   type AiToolCallbacks,
 } from '../services/aiService';
 import {
+  buildProjectRenderInputs,
+  loadConfiguredLibraryAssets,
+} from '../services/projectRenderInputs';
+import {
   getApiKey,
   getProviderFromModel,
   getStoredModel,
@@ -297,6 +301,28 @@ export function useAiAgent(options: UseAiAgentOptions = {}) {
         return state.files[normalizedPath]?.content ?? null;
       },
       getRenderTargetPath: () => getProjectState().renderTargetPath,
+      getRenderValidationInputs: async () => {
+        const state = getProjectState();
+        const platform = getPlatform();
+        const settings = loadSettingsImpl();
+        const { libraryFiles, libraryPaths } = await loadConfiguredLibraryAssets(
+          settings.library,
+          platform
+        );
+
+        const renderInputs = await buildProjectRenderInputs({
+          state,
+          libraryFiles,
+          libraryPaths,
+          platform: state.projectRoot ? platform : undefined,
+        });
+
+        return {
+          code: renderInputs.code,
+          renderTargetPath: renderInputs.renderTargetPath,
+          renderOptions: renderInputs.renderOptions,
+        };
+      },
       createProjectFile: (path: string, content: string) => {
         const normalizedPath = normalizeProjectRelativePath(path);
         if (!normalizedPath) return false;
@@ -356,7 +382,7 @@ export function useAiAgent(options: UseAiAgentOptions = {}) {
         updateSettingImpl('viewer', { measurementUnit: unit });
       },
     }),
-    [updateSettingImpl]
+    [loadSettingsImpl, updateSettingImpl]
   );
 
   const tools: ToolSet = useMemo(() => buildToolsImpl(callbacks), [buildToolsImpl, callbacks]);
