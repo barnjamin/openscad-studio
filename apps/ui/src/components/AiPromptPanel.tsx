@@ -1,6 +1,6 @@
 import { useRef, useEffect, useState, forwardRef, useImperativeHandle } from 'react';
 import { ChatImage, ChatImageGrid } from './ChatImage';
-import { Button } from './ui';
+import { Accordion, AccordionContent, AccordionItem, AccordionTrigger, Button } from './ui';
 import { MarkdownMessage } from './MarkdownMessage';
 import { ModelSelector } from './ModelSelector';
 import { AiComposer, type AiComposerRef } from './AiComposer';
@@ -102,6 +102,209 @@ function getToolStateMeta(state: ToolCallState) {
   }
 }
 
+function sanitizeToolDetailString(value: string): string {
+  if (value.startsWith('data:image/')) {
+    return `[image data URL omitted, ${value.length.toLocaleString()} characters]`;
+  }
+
+  return value;
+}
+
+function sanitizeToolDetailValue(value: unknown, seen = new WeakSet<object>()): unknown {
+  if (typeof value === 'string') {
+    return sanitizeToolDetailString(value);
+  }
+
+  if (
+    value === null ||
+    value === undefined ||
+    typeof value === 'number' ||
+    typeof value === 'boolean'
+  ) {
+    return value;
+  }
+
+  if (typeof value === 'bigint') {
+    return value.toString();
+  }
+
+  if (Array.isArray(value)) {
+    return value.map((item) => sanitizeToolDetailValue(item, seen));
+  }
+
+  if (typeof value === 'object') {
+    if (seen.has(value)) {
+      return '[Circular]';
+    }
+
+    seen.add(value);
+
+    if (value instanceof Error) {
+      return {
+        name: value.name,
+        message: value.message,
+        stack: value.stack ? sanitizeToolDetailString(value.stack) : undefined,
+      };
+    }
+
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>).map(([key, entryValue]) => [
+        key,
+        sanitizeToolDetailValue(entryValue, seen),
+      ])
+    );
+  }
+
+  return String(value);
+}
+
+function formatToolDetailValue(value: unknown): string {
+  if (value === undefined) {
+    return '';
+  }
+
+  if (typeof value === 'string') {
+    const trimmed = value.trim();
+    if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
+      try {
+        return JSON.stringify(sanitizeToolDetailValue(JSON.parse(trimmed)), null, 2);
+      } catch {
+        return sanitizeToolDetailString(value);
+      }
+    }
+
+    return sanitizeToolDetailString(value);
+  }
+
+  try {
+    return JSON.stringify(sanitizeToolDetailValue(value), null, 2);
+  } catch {
+    return String(value);
+  }
+}
+
+function getMissingToolResultLabel(state: ToolCallState): string {
+  if (state === 'pending') return 'Waiting for result...';
+  if (state === 'error') return 'No result returned before the tool failed.';
+  if (state === 'denied') return 'No result returned because the tool output was denied.';
+  return 'No result returned.';
+}
+
+interface ToolCallDetailSectionProps {
+  label: string;
+  value?: unknown;
+  emptyLabel: string;
+}
+
+function ToolCallDetailSection({ label, value, emptyLabel }: ToolCallDetailSectionProps) {
+  const formattedValue = value === undefined ? '' : formatToolDetailValue(value);
+
+  return (
+    <div className="space-y-1">
+      <div
+        className="text-[11px] font-semibold uppercase tracking-[0.08em]"
+        style={{ color: 'var(--text-tertiary)' }}
+      >
+        {label}
+      </div>
+      <div
+        className="rounded-md border px-2 py-2"
+        style={{
+          backgroundColor: 'var(--bg-secondary)',
+          borderColor: 'var(--border-secondary)',
+        }}
+      >
+        {formattedValue ? (
+          <pre
+            className="m-0 whitespace-pre-wrap break-words font-mono text-[11px] leading-relaxed"
+            style={{ color: 'var(--text-secondary)' }}
+          >
+            {formattedValue}
+          </pre>
+        ) : (
+          <div className="text-xs italic" style={{ color: 'var(--text-tertiary)' }}>
+            {emptyLabel}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+interface ToolCallCardProps {
+  toolName: string;
+  state: ToolCallState;
+  args?: Record<string, unknown>;
+  result?: unknown;
+  errorText?: string;
+}
+
+function ToolCallCard({ toolName, state, args, result, errorText }: ToolCallCardProps) {
+  const toolStateMeta = getToolStateMeta(state);
+  const imageDataUrl =
+    toolName === 'get_preview_screenshot' ? getImageDataUrlFromResult(result) : null;
+
+  return (
+    <div
+      className="rounded-lg px-3 py-2 border"
+      style={{
+        backgroundColor: 'var(--bg-primary)',
+        borderColor: toolStateMeta.borderColor,
+      }}
+    >
+      <div className="flex items-center gap-2 text-sm">
+        {toolStateMeta.icon}
+        <span className="font-semibold" style={{ color: toolStateMeta.color }}>
+          {toolName}
+        </span>
+        <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
+          {toolStateMeta.label}
+        </span>
+      </div>
+      {errorText && (
+        <div className="mt-2 text-xs" style={{ color: 'var(--color-error)' }}>
+          {errorText}
+        </div>
+      )}
+      {imageDataUrl && (
+        <div className="mt-2">
+          <ChatImage src={imageDataUrl} alt="Preview screenshot" filename="preview.png" />
+        </div>
+      )}
+      <div className="mt-2 rounded-md border" style={{ borderColor: 'var(--border-secondary)' }}>
+        <Accordion type="single" collapsible>
+          <AccordionItem value="details" className="border-none">
+            <AccordionTrigger
+              className="flex w-full items-center justify-between gap-3 px-2 py-1.5 text-left text-xs font-medium"
+              style={{ color: 'var(--text-secondary)' }}
+            >
+              <span>Tool details</span>
+              <span style={{ color: 'var(--text-tertiary)' }}>Expand</span>
+            </AccordionTrigger>
+            <AccordionContent className="px-2 pb-2">
+              <div
+                className="space-y-2 border-t pt-2"
+                style={{ borderColor: 'var(--border-secondary)' }}
+              >
+                <ToolCallDetailSection
+                  label="Input"
+                  value={args}
+                  emptyLabel="No input parameters."
+                />
+                <ToolCallDetailSection
+                  label="Result"
+                  value={result}
+                  emptyLabel={getMissingToolResultLabel(state)}
+                />
+              </div>
+            </AccordionContent>
+          </AccordionItem>
+        </Accordion>
+      </div>
+    </div>
+  );
+}
+
 export interface AiPromptPanelProps {
   onSubmit: () => void;
   onTextChange: (text: string) => void;
@@ -182,7 +385,7 @@ export const AiPromptPanel = forwardRef<AiPromptPanelRef, AiPromptPanelProps>(
     }, [messages, streamingResponse, currentToolCalls]);
 
     useEffect(() => {
-      if (import.meta.env.DEV) {
+      if (import.meta.env?.DEV) {
         console.log('[AiPromptPanel] Messages updated. Count:', messages.length);
       }
     }, [messages]);
@@ -436,45 +639,16 @@ export const AiPromptPanel = forwardRef<AiPromptPanelRef, AiPromptPanelProps>(
 
               if (message.type === 'tool-call') {
                 const toolMessage = message as ToolCallMessage;
-                const toolStateMeta = getToolStateMeta(toolMessage.state);
-                const imageDataUrl =
-                  toolMessage.toolName === 'get_preview_screenshot'
-                    ? getImageDataUrlFromResult(toolMessage.result)
-                    : null;
 
                 return (
                   <div key={message.id} className="flex gap-2 justify-start">
-                    <div
-                      className="rounded-lg px-3 py-2 border"
-                      style={{
-                        backgroundColor: 'var(--bg-primary)',
-                        borderColor: toolStateMeta.borderColor,
-                      }}
-                    >
-                      <div className="flex items-center gap-2 text-sm">
-                        {toolStateMeta.icon}
-                        <span className="font-semibold" style={{ color: toolStateMeta.color }}>
-                          {message.toolName}
-                        </span>
-                        <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
-                          {toolStateMeta.label}
-                        </span>
-                      </div>
-                      {message.errorText && (
-                        <div className="mt-2 text-xs" style={{ color: 'var(--color-error)' }}>
-                          {message.errorText}
-                        </div>
-                      )}
-                      {imageDataUrl && (
-                        <div className="mt-2">
-                          <ChatImage
-                            src={imageDataUrl}
-                            alt="Preview screenshot"
-                            filename="preview.png"
-                          />
-                        </div>
-                      )}
-                    </div>
+                    <ToolCallCard
+                      toolName={toolMessage.toolName}
+                      state={toolMessage.state}
+                      args={toolMessage.args}
+                      result={toolMessage.result}
+                      errorText={toolMessage.errorText}
+                    />
                   </div>
                 );
               }
@@ -485,48 +659,16 @@ export const AiPromptPanel = forwardRef<AiPromptPanelRef, AiPromptPanelProps>(
             {currentToolCalls.length > 0 && (
               <div className="flex gap-2 justify-start">
                 <div className="space-y-2">
-                  {currentToolCalls.map((tool) => {
-                    const toolStateMeta = getToolStateMeta(tool.state);
-                    const imageDataUrl =
-                      tool.name === 'get_preview_screenshot'
-                        ? getImageDataUrlFromResult(tool.result)
-                        : null;
-
-                    return (
-                      <div
-                        key={tool.toolCallId}
-                        className="rounded-lg px-3 py-2 border"
-                        style={{
-                          backgroundColor: 'var(--bg-primary)',
-                          borderColor: toolStateMeta.borderColor,
-                        }}
-                      >
-                        <div className="flex items-center gap-2 text-sm">
-                          {toolStateMeta.icon}
-                          <span className="font-semibold" style={{ color: toolStateMeta.color }}>
-                            {tool.name}
-                          </span>
-                          <span className="text-xs" style={{ color: 'var(--text-tertiary)' }}>
-                            {toolStateMeta.label}
-                          </span>
-                        </div>
-                        {tool.errorText && (
-                          <div className="mt-2 text-xs" style={{ color: 'var(--color-error)' }}>
-                            {tool.errorText}
-                          </div>
-                        )}
-                        {imageDataUrl && (
-                          <div className="mt-2">
-                            <ChatImage
-                              src={imageDataUrl}
-                              alt="Preview screenshot"
-                              filename="preview.png"
-                            />
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
+                  {currentToolCalls.map((tool) => (
+                    <ToolCallCard
+                      key={tool.toolCallId}
+                      toolName={tool.name}
+                      state={tool.state}
+                      args={tool.args}
+                      result={tool.result}
+                      errorText={tool.errorText}
+                    />
+                  ))}
                 </div>
               </div>
             )}
