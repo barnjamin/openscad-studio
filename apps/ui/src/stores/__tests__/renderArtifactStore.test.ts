@@ -39,7 +39,9 @@ describe('renderArtifactStore', () => {
     expect(getLatestArtifactForTarget('openscad/poly555.scad')?.previewSrc).toBe('blob:poly555');
     expect(getLatestSuccessfulArtifactForTarget('openscad/poly555.scad')?.requestId).toBe(7);
     expect(getArtifactByRequestId(7)?.renderTargetPath).toBe('openscad/poly555.scad');
-    expect(getRenderArtifactState().inFlightRequestIdByTarget['openscad/poly555.scad']).toBeUndefined();
+    expect(
+      getRenderArtifactState().inFlightRequestIdByTarget['openscad/poly555.scad']
+    ).toBeUndefined();
   });
 
   it('keeps the last successful artifact when a later render fails', () => {

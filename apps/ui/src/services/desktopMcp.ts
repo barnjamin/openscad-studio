@@ -188,8 +188,7 @@ function textResponse(text: string, isError = false): McpToolResponse {
 }
 
 function debugLog(message: string, payload?: Record<string, unknown>) {
-  const isDev =
-    (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV ?? false;
+  const isDev = (import.meta as ImportMeta & { env?: { DEV?: boolean } }).env?.DEV ?? false;
   if (isDev) {
     console.debug(message, payload);
   }
@@ -270,7 +269,9 @@ function buildRenderRecoveryGuidance(options: { includeTriggerRender?: boolean }
   }
 
   guidance.push('Call `get_diagnostics` to inspect the current render errors and warnings.');
-  guidance.push('Call `get_project_context` to verify which file is currently set as the render target.');
+  guidance.push(
+    'Call `get_project_context` to verify which file is currently set as the render target.'
+  );
   guidance.push(
     'If the wrong file is selected, call `set_render_target` with the correct workspace-relative path.'
   );
@@ -296,10 +297,16 @@ function buildContextualRenderFailureMessage(options: {
   ].join('\n\n');
 }
 
-function buildPreviewTroubleshootingMessage(rawError: string, options: { requestedView: string }): string {
+function buildPreviewTroubleshootingMessage(
+  rawError: string,
+  options: { requestedView: string }
+): string {
   const currentRenderTargetPath = getCurrentRenderTargetPath();
   const artifact = getCurrentRenderArtifact();
-  const sections = [rawError, `Render target: ${currentRenderTargetPath ?? '(no active render target)'}`];
+  const sections = [
+    rawError,
+    `Render target: ${currentRenderTargetPath ?? '(no active render target)'}`,
+  ];
   const renderState = classifyCurrentRenderState();
 
   if (renderState === 'missing_artifact') {
@@ -359,9 +366,7 @@ function resolveRenderWaiter(requestId: number) {
   const [id, waiter] = entry;
   const artifact = getArtifactByRequestId(requestId);
   if (!artifact) {
-    waiter.reject(
-      new Error(`Render ${requestId} settled without a published render artifact.`)
-    );
+    waiter.reject(new Error(`Render ${requestId} settled without a published render artifact.`));
     clearTimeout(waiter.timeoutId);
     renderWaiters.delete(id);
     return;
@@ -443,8 +448,7 @@ async function refreshMcpRenderSnapshot(
   libraryContext: LibraryContext,
   toolName: 'trigger_render' | 'get_diagnostics' | 'export_file'
 ): Promise<
-  | { ok: true; source: string; summary: McpRenderSnapshotSummary }
-  | { ok: false; message: string }
+  { ok: true; source: string; summary: McpRenderSnapshotSummary } | { ok: false; message: string }
 > {
   const state = getProjectState();
   const renderTargetPath = normalizeProjectRelativePath(state.renderTargetPath ?? '');
@@ -844,10 +848,9 @@ async function handleExportFile(argumentsValue: Record<string, unknown>): Promis
   const source = getRenderTargetContent(state);
   if (!source) {
     return textResponse(
-      [
-        '❌ No active render target is available to export.',
-        buildRenderRecoveryGuidance(),
-      ].join('\n\n'),
+      ['❌ No active render target is available to export.', buildRenderRecoveryGuidance()].join(
+        '\n\n'
+      ),
       true
     );
   }

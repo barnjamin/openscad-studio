@@ -3,7 +3,7 @@ import { createAnthropic } from '@ai-sdk/anthropic';
 import { createOpenAI } from '@ai-sdk/openai';
 import { z } from 'zod';
 import { eventBus, historyService } from '../platform';
-import { getRenderService } from './renderService';
+import { getRenderService, type RenderOptions } from './renderService';
 import type { PreviewSceneStyle } from './previewSceneConfig';
 import type { AiProvider } from '../stores/apiKeyStore';
 import type { MeasurementUnit } from '../stores/settingsStore';
@@ -24,6 +24,12 @@ export interface AiToolCallbacks {
   readProjectFile: (path: string) => string | null;
   /** Returns the current render target path */
   getRenderTargetPath: () => string | null;
+  /** Build the current render validation inputs using the same project snapshot path as preview renders. */
+  getRenderValidationInputs: () => Promise<{
+    code: string;
+    renderTargetPath: string | null;
+    renderOptions: RenderOptions;
+  }>;
   /** Create a new file in the project */
   createProjectFile: (path: string, content: string) => boolean;
   /** Edit a file by exact string replacement. Returns null on success, error string on failure. */
@@ -321,9 +327,14 @@ export function buildTools(callbacks: AiToolCallbacks) {
       description: 'Get current OpenSCAD compilation errors and warnings',
       inputSchema: z.object({}),
       execute: async () => {
-        const renderTarget = callbacks.getRenderTargetPath();
-        const currentCode = renderTarget ? (callbacks.readProjectFile(renderTarget) ?? '') : '';
-        const result = await getRenderService().checkSyntax(currentCode);
+        const { code, renderTargetPath, renderOptions } =
+          await callbacks.getRenderValidationInputs();
+
+        if (!renderTargetPath) {
+          return '❌ No render target set.';
+        }
+
+        const result = await getRenderService().checkSyntax(code, renderOptions);
 
         if (result.diagnostics.length === 0) {
           return '✅ No errors or warnings. The code compiles successfully.';

@@ -149,7 +149,11 @@ export async function resolveWorkingDirDepsDetailed(
   }
 
   async function resolveFile(normalizedPath: string): Promise<[string, string] | null> {
-    const dirtyMatch = lookupProjectFileCandidate(normalizedPath, dirtyProjectFiles, renderTargetDir);
+    const dirtyMatch = lookupProjectFileCandidate(
+      normalizedPath,
+      dirtyProjectFiles,
+      renderTargetDir
+    );
     if (dirtyMatch) {
       stats.dirtyProjectFileHits += 1;
       return dirtyMatch;

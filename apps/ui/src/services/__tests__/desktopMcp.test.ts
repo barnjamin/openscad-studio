@@ -49,18 +49,11 @@ const projectStoreModule = new URL('../../stores/projectStore.ts', import.meta.u
 const settingsStoreModule = new URL('../../stores/settingsStore.ts', import.meta.url).pathname;
 const workspaceStoreModule = new URL('../../stores/workspaceStore.ts', import.meta.url).pathname;
 const platformModule = new URL('../../platform/index.ts', import.meta.url).pathname;
-const renderRequestStoreModule = new URL(
-  '../../stores/renderRequestStore.ts',
-  import.meta.url
-).pathname;
-const projectFilePathsModule = new URL(
-  '../../utils/projectFilePaths.ts',
-  import.meta.url
-).pathname;
-const resolveWorkingDirDepsModule = new URL(
-  '../../utils/resolveWorkingDirDeps.ts',
-  import.meta.url
-).pathname;
+const renderRequestStoreModule = new URL('../../stores/renderRequestStore.ts', import.meta.url)
+  .pathname;
+const projectFilePathsModule = new URL('../../utils/projectFilePaths.ts', import.meta.url).pathname;
+const resolveWorkingDirDepsModule = new URL('../../utils/resolveWorkingDirDeps.ts', import.meta.url)
+  .pathname;
 const desktopMcpModule = new URL('../desktopMcp.ts', import.meta.url).pathname;
 
 jest.unstable_mockModule('@tauri-apps/api/core', () => ({
@@ -172,13 +165,18 @@ let getRenderArtifactState: typeof import('../../stores/renderArtifactStore').ge
 let resetRenderArtifactStoreForTests: typeof import('../../stores/renderArtifactStore').__resetRenderArtifactStoreForTests;
 
 type ToolResponse = {
-  content: Array<{ type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }>;
+  content: Array<
+    { type: 'text'; text: string } | { type: 'image'; data: string; mimeType: string }
+  >;
   isError?: boolean;
 };
 
 function getText(response: ToolResponse): string {
   return response.content
-    .filter((entry): entry is Extract<ToolResponse['content'][number], { type: 'text' }> => entry.type === 'text')
+    .filter(
+      (entry): entry is Extract<ToolResponse['content'][number], { type: 'text' }> =>
+        entry.type === 'text'
+    )
     .map((entry) => entry.text)
     .join('\n');
 }
@@ -200,7 +198,10 @@ function setProjectState(
   };
 }
 
-function createMockProjectFile(content: string, overrides: Partial<MockProjectFile> = {}): MockProjectFile {
+function createMockProjectFile(
+  content: string,
+  overrides: Partial<MockProjectFile> = {}
+): MockProjectFile {
   return {
     content,
     savedContent: content,
@@ -275,7 +276,7 @@ describe('desktopMcp', () => {
     });
     mockGetRenderTargetContent.mockImplementation((state: typeof mockProjectState) => {
       const renderTargetPath = state.renderTargetPath;
-      return renderTargetPath ? state.files[renderTargetPath]?.content ?? null : null;
+      return renderTargetPath ? (state.files[renderTargetPath]?.content ?? null) : null;
     });
     mockCaptureOffscreen.mockReset();
     mockCaptureOffscreen.mockResolvedValue('data:image/png;base64,ZmFrZS1wbmc=');
@@ -396,8 +397,8 @@ describe('desktopMcp', () => {
       });
       notifyDesktopMcpRenderSettled(requestId);
     });
-    mockCaptureOffscreen.mockImplementation(async (previewUrl: string) =>
-      `data:image/png;base64,${previewUrl}`
+    mockCaptureOffscreen.mockImplementation(
+      async (previewUrl: string) => `data:image/png;base64,${previewUrl}`
     );
 
     const renderResponse = (await executeToolRequestForTests({

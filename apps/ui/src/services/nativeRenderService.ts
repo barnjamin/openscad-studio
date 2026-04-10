@@ -205,11 +205,22 @@ export class NativeRenderService implements IRenderService {
   /**
    * Check syntax by rendering (same as WASM approach).
    */
-  async checkSyntax(code: string): Promise<SyntaxCheckResult> {
+  async checkSyntax(code: string, options: RenderOptions = {}): Promise<SyntaxCheckResult> {
     await this.init();
 
     const args = ['/input.scad', '-o', '/output.stl', '--backend=manifold'];
-    const result = await this.invokeRender(code, args);
+    const allFiles =
+      options.libraryFiles || options.auxiliaryFiles
+        ? { ...(options.libraryFiles || {}), ...(options.auxiliaryFiles || {}) }
+        : undefined;
+    const result = await this.invokeRender(
+      code,
+      args,
+      allFiles,
+      options.inputPath,
+      options.workingDir,
+      options.libraryPaths
+    );
     const diagnostics = parseOpenScadStderr(result.stderr);
 
     return { diagnostics };

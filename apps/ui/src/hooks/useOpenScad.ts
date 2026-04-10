@@ -6,11 +6,14 @@ import {
   type IRenderService,
   type Diagnostic,
 } from '../services/renderService';
+import {
+  buildProjectRenderInputs,
+  loadConfiguredLibraryAssets,
+} from '../services/projectRenderInputs';
 import { getPlatform } from '../platform';
 import type { LibrarySettings } from '../stores/settingsStore';
 import { resolveWorkingDirDeps } from '../utils/resolveWorkingDirDeps';
-import { getProjectState, getAuxiliaryFilesForRender } from '../stores/projectStore';
-import { normalizeProjectRelativePath } from '../utils/projectFilePaths';
+import { getProjectState } from '../stores/projectStore';
 import { notifyError } from '../utils/notifications';
 import { hasRenderableOutput } from './renderOutput';
 export type RenderKind = 'mesh' | 'svg';
@@ -131,26 +134,9 @@ export function useOpenScad(options: UseOpenScadOptions = {}) {
     const platform = getPlatformImpl();
 
     const loadLibraryFiles = async () => {
-      const files: Record<string, string> = {};
-
-      if (library) {
-        const systemPaths = library.autoDiscoverSystem ? await platform.getLibraryPaths() : [];
-        const allLibPaths = [...systemPaths, ...library.customPaths];
-        libraryPathsRef.current = allLibPaths;
-
-        for (const libPath of allLibPaths) {
-          try {
-            const libFiles = await platform.readDirectoryFiles(libPath);
-            Object.assign(files, libFiles);
-          } catch (err) {
-            console.warn(`[useOpenScad] Failed to read library path ${libPath}:`, err);
-          }
-        }
-      } else {
-        libraryPathsRef.current = [];
-      }
-
-      libraryFilesRef.current = files;
+      const { libraryFiles, libraryPaths } = await loadConfiguredLibraryAssets(library, platform);
+      libraryFilesRef.current = libraryFiles;
+      libraryPathsRef.current = libraryPaths;
       mergeAndSetAuxFiles();
     };
 
@@ -236,57 +222,24 @@ export function useOpenScad(options: UseOpenScadOptions = {}) {
         // instead of blindly scanning the entire working directory.
         // On web (no workingDir), project store files are the only source.
         const workingDir = workingDirRef.current;
-        const projectFiles = getAuxiliaryFilesForRender(getProjectState());
+        const renderInputs = await buildProjectRenderInputs({
+          code,
+          state: getProjectState(),
+          workingDir,
+          libraryFiles: libraryFilesRef.current,
+          libraryPaths: libraryPathsRef.current,
+          platform: workingDir ? getPlatformImpl() : undefined,
+          resolveWorkingDirDepsImpl,
+        });
 
-        // Build project-only auxiliary files (no library files — those are
-        // passed separately via libraryFiles/libraryPaths)
-        let projectAuxFiles: Record<string, string> = { ...projectFiles };
-
-        if (workingDir) {
-          const platform = getPlatformImpl();
-          const renderTargetPath = normalizeProjectRelativePath(
-            getProjectState().renderTargetPath ?? ''
-          );
-          const rtLastSlash = renderTargetPath?.lastIndexOf('/') ?? -1;
-          const renderTargetDir =
-            renderTargetPath && rtLastSlash > 0
-              ? renderTargetPath.substring(0, rtLastSlash)
-              : undefined;
-          const workingDirFiles = await resolveWorkingDirDepsImpl(code, {
-            workingDir,
-            libraryFiles: libraryFilesRef.current,
-            platform,
-            projectFiles,
-            renderTargetDir,
-          });
-
-          if (Object.keys(workingDirFiles).length > 0) {
-            projectAuxFiles = { ...projectAuxFiles, ...workingDirFiles };
-          }
-        }
-
-        // Update refs so the cache check uses consistent data on next render
-        workingDirFilesRef.current = Object.fromEntries(
-          Object.entries(projectAuxFiles).filter(([k]) => !(k in projectFiles))
-        );
+        // Update refs so the cache check uses consistent data on next render.
+        workingDirFilesRef.current = renderInputs.workingDirDependencyFiles;
         mergeAndSetAuxFiles();
 
-        const libraryFiles = libraryFilesRef.current;
-        // Merge all files for the render call — both services need library
-        // file contents (WASM for virtual FS, native because -L is not
-        // supported by the bundled OpenSCAD snapshot).  libraryPaths is
-        // passed so the native renderer can avoid writing library files
-        // into the project directory.
-        const allAuxFiles = { ...libraryFiles, ...projectAuxFiles };
         const renderOptions = {
+          ...renderInputs.renderOptions,
           view: dimension,
           backend: 'manifold',
-          auxiliaryFiles: Object.keys(allAuxFiles).length > 0 ? allAuxFiles : undefined,
-          libraryFiles: Object.keys(libraryFiles).length > 0 ? libraryFiles : undefined,
-          libraryPaths: libraryPathsRef.current.length > 0 ? libraryPathsRef.current : undefined,
-          inputPath:
-            normalizeProjectRelativePath(getProjectState().renderTargetPath ?? '') ?? undefined,
-          workingDir: workingDir || undefined,
         } as const;
 
         const cached = await renderServiceRef.current.getCached(code, renderOptions);

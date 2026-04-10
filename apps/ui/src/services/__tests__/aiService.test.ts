@@ -1,14 +1,15 @@
 import { jest } from '@jest/globals';
 
 const mockCaptureOffscreen = jest.fn(async () => 'data:image/png;base64,AAA=');
+const mockCheckSyntax = jest.fn(async () => ({ diagnostics: [] }));
 
 jest.unstable_mockModule('@/services/renderService', () => ({
   getRenderService: () => ({
-    checkSyntax: async () => ({ diagnostics: [] }),
+    checkSyntax: (...args: unknown[]) => mockCheckSyntax(...args),
   }),
   RenderService: {
     getInstance: () => ({
-      checkSyntax: async () => ({ diagnostics: [] }),
+      checkSyntax: (...args: unknown[]) => mockCheckSyntax(...args),
     }),
   },
 }));
@@ -50,6 +51,16 @@ function createCallbacks(overrides: Partial<AiToolCallbacks> = {}): AiToolCallba
       return files[path] ?? null;
     },
     getRenderTargetPath: () => 'main.scad',
+    getRenderValidationInputs: async () => ({
+      code: 'use <lib/utils.scad>\ncube(10);',
+      renderTargetPath: 'main.scad',
+      renderOptions: {
+        auxiliaryFiles: {
+          'lib/utils.scad': 'module helper() { cube(5); }',
+        },
+        inputPath: 'main.scad',
+      },
+    }),
     createProjectFile: () => true,
     editProjectFile: () => null,
     requestRender: () => {},
@@ -63,6 +74,11 @@ function createCallbacks(overrides: Partial<AiToolCallbacks> = {}): AiToolCallba
 describe('buildTools', () => {
   beforeAll(async () => {
     ({ buildTools } = await import('../aiService'));
+  });
+
+  beforeEach(() => {
+    mockCheckSyntax.mockClear();
+    mockCheckSyntax.mockResolvedValue({ diagnostics: [] });
   });
 
   describe('get_project_context', () => {
@@ -272,6 +288,45 @@ describe('buildTools', () => {
       })) as string;
 
       expect(result).toContain('❌ Failed to apply edit');
+    });
+  });
+
+  describe('get_diagnostics', () => {
+    it('validates with the shared multi-file render inputs', async () => {
+      const tools = buildTools(createCallbacks()) as Record<string, ExecutableTool>;
+
+      await tools.get_diagnostics.execute({});
+
+      expect(mockCheckSyntax).toHaveBeenCalledWith(
+        'use <lib/utils.scad>\ncube(10);',
+        expect.objectContaining({
+          auxiliaryFiles: {
+            'lib/utils.scad': 'module helper() { cube(5); }',
+          },
+          inputPath: 'main.scad',
+        })
+      );
+    });
+
+    it('formats returned diagnostics', async () => {
+      mockCheckSyntax.mockResolvedValue({
+        diagnostics: [
+          {
+            severity: 'warning',
+            line: 13,
+            col: undefined,
+            message: "WARNING: Can't open include file 'lib/base.scad'.",
+          },
+        ],
+      });
+      const tools = buildTools(createCallbacks()) as Record<string, ExecutableTool>;
+
+      const result = (await tools.get_diagnostics.execute({})) as string;
+
+      expect(result).toContain('Current diagnostics:');
+      expect(result).toContain(
+        "[Warning] (line 13): WARNING: Can't open include file 'lib/base.scad'."
+      );
     });
   });
 

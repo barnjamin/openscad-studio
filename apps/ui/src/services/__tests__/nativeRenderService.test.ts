@@ -118,4 +118,55 @@ describe('NativeRenderService', () => {
       })
     ).resolves.toBeNull();
   });
+
+  it('forwards syntax-check render context to the native invoke call', async () => {
+    invoke.mockImplementation(async (command: string, payload?: Record<string, unknown>) => {
+      if (command === 'render_init') return 'OpenSCAD 2026.03.16';
+      if (command === 'render_native') {
+        return {
+          output: [],
+          stderr: 'WARNING: include note',
+          exit_code: 0,
+          duration_ms: 1,
+          payload,
+        };
+      }
+      throw new Error(`Unexpected command: ${command}`);
+    });
+
+    const { NativeRenderService } = await import('../nativeRenderService');
+    const service = new NativeRenderService();
+
+    await expect(
+      service.checkSyntax('use <shared.scad>;\ncube(10);', {
+        auxiliaryFiles: { 'shared.scad': 'module helper() {}' },
+        libraryFiles: { 'libraries/util.scad': 'module util() {}' },
+        inputPath: 'models/main.scad',
+        workingDir: '/workspace',
+        libraryPaths: ['/lib/system'],
+      })
+    ).resolves.toEqual({
+      diagnostics: [
+        {
+          severity: 'warning',
+          line: undefined,
+          col: undefined,
+          message: 'WARNING: include note',
+        },
+      ],
+    });
+
+    expect(invoke).toHaveBeenCalledWith(
+      'render_native',
+      expect.objectContaining({
+        auxiliaryFiles: {
+          'shared.scad': 'module helper() {}',
+          'libraries/util.scad': 'module util() {}',
+        },
+        inputPath: 'models/main.scad',
+        workingDir: '/workspace',
+        libraryPaths: ['/lib/system'],
+      })
+    );
+  });
 });

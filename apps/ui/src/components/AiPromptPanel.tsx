@@ -272,7 +272,11 @@ export const AiPromptPanel = forwardRef<AiPromptPanelRef, AiPromptPanelProps>(
       return (
         <div
           ref={emptyStateHostRef}
-          className="h-full overflow-y-auto flex items-start justify-center px-6 py-6"
+          className={
+            isDesktop
+              ? 'h-full overflow-y-auto flex items-start justify-center px-6 py-6'
+              : 'h-full overflow-y-auto flex items-center justify-center px-6'
+          }
           style={{ backgroundColor: 'var(--bg-primary)' }}
         >
           {isDesktop ? (

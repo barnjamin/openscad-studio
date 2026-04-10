@@ -201,7 +201,7 @@ export interface IRenderService {
   render(code: string, options?: RenderOptions): Promise<RenderResult>;
   getCached(code: string, options?: RenderOptions): Promise<RenderResult | null>;
   exportModel(code: string, format: ExportFormat, options?: ExportOptions): Promise<Uint8Array>;
-  checkSyntax(code: string): Promise<SyntaxCheckResult>;
+  checkSyntax(code: string, options?: RenderOptions): Promise<SyntaxCheckResult>;
   cancel(): void;
   clearCache(): void;
   dispose(): void;
@@ -446,9 +446,13 @@ export class WasmRenderService implements IRenderService {
   /**
    * Check syntax by attempting to render. Returns diagnostics only.
    */
-  async checkSyntax(code: string): Promise<SyntaxCheckResult> {
+  async checkSyntax(code: string, options: RenderOptions = {}): Promise<SyntaxCheckResult> {
     const args = this.buildArgs('/output.stl', { backend: 'manifold' });
-    const result = await this.sendRequest(code, args);
+    const allFiles =
+      options.libraryFiles || options.auxiliaryFiles
+        ? { ...(options.libraryFiles || {}), ...(options.auxiliaryFiles || {}) }
+        : undefined;
+    const result = await this.sendRequest(code, args, allFiles, options.inputPath);
     const diagnostics = parseOpenScadStderr(result.stderr);
 
     return { diagnostics };

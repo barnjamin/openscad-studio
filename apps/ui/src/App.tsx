@@ -286,7 +286,7 @@ function App() {
   const renderTargetTab = tabs.find((t) => t.projectPath === renderTargetPath);
   const renderTargetRender = renderTargetTab?.render ?? activeRender;
   const activeRenderArtifact = useRenderArtifactStore((state) =>
-    renderTargetPath ? state.artifactsByTarget[renderTargetPath] ?? null : null
+    renderTargetPath ? (state.artifactsByTarget[renderTargetPath] ?? null) : null
   );
   const createTab = useWorkspaceStore((state) => state.createTab);
   const setActiveTab = useWorkspaceStore((state) => state.setActiveTab);
@@ -428,7 +428,7 @@ function App() {
       const settledRenderTargetPath =
         getProjectStore().getState().renderTargetPath ??
         (owner
-          ? getWorkspaceState().tabs.find((tab) => tab.id === owner.tabId)?.projectPath ?? null
+          ? (getWorkspaceState().tabs.find((tab) => tab.id === owner.tabId)?.projectPath ?? null)
           : null);
       if (owner && settledRenderTargetPath) {
         getRenderArtifactState().publishSettledArtifact({
