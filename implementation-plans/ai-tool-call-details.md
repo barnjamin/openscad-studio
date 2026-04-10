@@ -23,4 +23,4 @@ Add collapsed-by-default detail views to AI pane tool call blocks so users can e
 - [x] Implement collapsed-by-default expandable tool call detail blocks in the AI pane
 - [x] Add or update frontend tests for tool call detail expansion
 - [x] Run relevant validation for the frontend changes
-- [ ] Create a draft PR against `main` and capture preview status if applicable
+- [x] Create a draft PR against `main` and capture preview status if applicable
