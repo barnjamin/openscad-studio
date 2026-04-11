@@ -46,6 +46,14 @@ function createHarness(options?: Parameters<typeof useAiAgent>[0]) {
   return createHookHarness(() => useAiAgent(options));
 }
 
+function createApplyEditOutput(checkpointId?: string) {
+  return {
+    status: 'success',
+    message: 'Edit applied successfully.',
+    ...(checkpointId ? { __checkpointId: checkpointId } : {}),
+  };
+}
+
 describe('useAiAgent', () => {
   beforeEach(() => {
     localStorage.clear();
@@ -604,7 +612,7 @@ describe('useAiAgent', () => {
               toolCallId: 'tool-1',
               toolName: 'apply_edit',
               input: {},
-              output: 'Applied [CHECKPOINT:cp-123]',
+              output: createApplyEditOutput('cp-123'),
             } as StreamChunk,
             {
               type: 'error',
@@ -635,7 +643,7 @@ describe('useAiAgent', () => {
           toolCallId: 'tool-1',
           toolName: 'apply_edit',
           state: 'completed',
-          result: 'Applied [CHECKPOINT:cp-123]',
+          result: createApplyEditOutput('cp-123'),
         }),
       ])
     );
@@ -664,7 +672,7 @@ describe('useAiAgent', () => {
               toolCallId: 'tool-1',
               toolName: 'apply_edit',
               input: {},
-              output: 'Applied [CHECKPOINT:cp-1]',
+              output: createApplyEditOutput('cp-1'),
             } as StreamChunk,
             { type: 'tool-input-start', id: 'tool-2', toolName: 'apply_edit' },
             {
@@ -678,7 +686,7 @@ describe('useAiAgent', () => {
               toolCallId: 'tool-2',
               toolName: 'apply_edit',
               input: {},
-              output: 'Applied [CHECKPOINT:cp-2]',
+              output: createApplyEditOutput('cp-2'),
             } as StreamChunk,
             {
               type: 'finish',
@@ -727,7 +735,7 @@ describe('useAiAgent', () => {
               toolCallId: 'tool-1',
               toolName: 'apply_edit',
               input: {},
-              output: 'Applied [CHECKPOINT:cp-1]',
+              output: createApplyEditOutput('cp-1'),
             } as StreamChunk,
             { type: 'tool-input-start', id: 'tool-2', toolName: 'apply_edit' },
             {
@@ -790,7 +798,7 @@ describe('useAiAgent', () => {
               toolCallId: 'tool-1',
               toolName: 'apply_edit',
               input: {},
-              output: 'Applied [CHECKPOINT:cp-1]',
+              output: createApplyEditOutput('cp-1'),
             } as StreamChunk,
             { type: 'tool-input-start', id: 'tool-2', toolName: 'apply_edit' },
             {
@@ -865,7 +873,7 @@ describe('useAiAgent', () => {
               toolCallId: 'tool-1',
               toolName: 'apply_edit',
               input: {},
-              output: 'Applied [CHECKPOINT:cp-1]',
+              output: createApplyEditOutput('cp-1'),
             } as StreamChunk,
             { type: 'tool-input-start', id: 'tool-2', toolName: 'apply_edit' },
             {
@@ -879,7 +887,7 @@ describe('useAiAgent', () => {
               toolCallId: 'tool-2',
               toolName: 'apply_edit',
               input: {},
-              output: 'Applied [CHECKPOINT:cp-2]',
+              output: createApplyEditOutput('cp-2'),
             } as StreamChunk,
             { type: 'text-start', id: 'text-1' },
             { type: 'text-delta', id: 'text-1', text: 'Done.' },

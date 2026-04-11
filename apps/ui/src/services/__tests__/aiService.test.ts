@@ -238,11 +238,13 @@ describe('buildTools', () => {
         file_path: 'lib/utils.scad',
         old_string: 'cube(5)',
         new_string: 'cube(10)',
-        rationale: 'resize helper',
       });
 
       expect(editProjectFile).toHaveBeenCalledWith('lib/utils.scad', 'cube(5)', 'cube(10)');
-      expect(result).toContain('✅ Edit applied to lib/utils.scad');
+      expect(result).toEqual({
+        status: 'success',
+        message: 'Edit applied to lib/utils.scad.',
+      });
     });
 
     it('returns error from editProjectFile', async () => {
@@ -256,7 +258,6 @@ describe('buildTools', () => {
         file_path: 'lib/utils.scad',
         old_string: 'nonexistent',
         new_string: 'replaced',
-        rationale: 'test',
       });
 
       expect(result).toContain('❌ Failed to apply edit to lib/utils.scad');
@@ -268,10 +269,13 @@ describe('buildTools', () => {
       const result = (await tools.apply_edit.execute({
         old_string: 'cube(10)',
         new_string: 'cube(20)',
-        rationale: 'make bigger',
-      })) as string;
+      })) as { status: 'success'; message: string; __checkpointId?: string };
 
-      expect(result).toContain('✅ Edit applied successfully');
+      expect(result).toMatchObject({
+        status: 'success',
+        message: 'Edit applied successfully.',
+      });
+      expect(result.__checkpointId).toBeTruthy();
     });
 
     it('reports error when old_string not found in render target', async () => {
@@ -284,7 +288,6 @@ describe('buildTools', () => {
       const result = (await tools.apply_edit.execute({
         old_string: 'nonexistent_string',
         new_string: 'replacement',
-        rationale: 'test',
       })) as string;
 
       expect(result).toContain('❌ Failed to apply edit');

@@ -79,6 +79,11 @@ function humanizeStreamError(errorText: string): string {
 }
 
 function extractApplyEditCheckpointId(output: unknown): string | null {
+  if (typeof output === 'object' && output !== null && '__checkpointId' in output) {
+    const checkpointId = (output as { __checkpointId?: unknown }).__checkpointId;
+    return typeof checkpointId === 'string' ? checkpointId : null;
+  }
+
   if (typeof output !== 'string') return null;
 
   const checkpointMatch = output.match(/\[CHECKPOINT:([\w-]+)\]/);
