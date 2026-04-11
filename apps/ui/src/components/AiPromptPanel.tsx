@@ -292,6 +292,11 @@ function ToolCallCard({ toolName, state, args, result, errorText }: ToolCallCard
           </svg>
         </span>
       </Button>
+      {imageDataUrl && !expanded && (
+        <div className="mt-2">
+          <ChatImage src={imageDataUrl} alt="Preview screenshot" filename="preview.png" />
+        </div>
+      )}
       {expanded && (
         <div
           className="mt-2 space-y-2 border-t pt-2"

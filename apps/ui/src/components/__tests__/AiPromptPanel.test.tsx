@@ -91,6 +91,23 @@ function createPendingToolCall(): ToolCall {
   };
 }
 
+function createScreenshotToolMessage(): Message {
+  return {
+    type: 'tool-call',
+    id: 'message-2',
+    toolCallId: 'tool-2',
+    toolName: 'get_preview_screenshot',
+    args: {
+      view: 'front',
+    },
+    result: {
+      image_data_url: 'data:image/png;base64,AAA=',
+    },
+    state: 'completed',
+    timestamp: 2,
+  };
+}
+
 function createUserMessage(): Message {
   return {
     type: 'user',
@@ -137,5 +154,22 @@ describe('AiPromptPanel', () => {
 
     expect(screen.getByText(/"path": "lib\.scad"/)).toBeTruthy();
     expect(screen.getByText('Waiting for result...')).toBeTruthy();
+  });
+
+  it('keeps screenshot thumbnails visible while the raw screenshot payload stays collapsed', () => {
+    renderWithProviders(
+      <AiPromptPanel {...createBaseProps({ messages: [createScreenshotToolMessage()] })} />
+    );
+
+    expect(screen.getByText('Preview screenshot')).toBeTruthy();
+    expect(screen.queryByText(/"view": "front"/)).toBeNull();
+    expect(screen.queryByText(/image_data_url/i)).toBeNull();
+
+    fireEvent.click(
+      screen.getByRole('button', { name: /expand details for get_preview_screenshot/i })
+    );
+
+    expect(screen.getByText(/"view": "front"/)).toBeTruthy();
+    expect(screen.getByText(/image_data_url/i)).toBeTruthy();
   });
 });
