@@ -19,6 +19,8 @@ export interface ModelInfo {
 export interface GroupedModels {
   anthropic: ModelInfo[];
   openai: ModelInfo[];
+  openrouter: ModelInfo[];
+  llamacpp: ModelInfo[];
 }
 
 export interface UseModelsReturn {
@@ -131,6 +133,52 @@ async function fetchOpenAiModels(apiKey: string): Promise<ModelInfo[]> {
       provider: 'openai' as const,
       visionSupport: getVisionSupportForModelId(m.id),
     }));
+}
+
+interface OpenRouterModel {
+  id: string;
+  name?: string;
+}
+
+interface OpenRouterModelsResponse {
+  data: OpenRouterModel[];
+}
+
+async function fetchOpenRouterModels(apiKey: string): Promise<ModelInfo[]> {
+  const resp = await fetch('https://openrouter.ai/api/v1/models', {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+
+  if (!resp.ok) {
+    throw new Error(`OpenRouter API error (${resp.status}): ${await resp.text()}`);
+  }
+
+  const data: OpenRouterModelsResponse = await resp.json();
+
+  return data.data.map((m) => ({
+    id: m.id,
+    display_name: KNOWN_DISPLAY_NAMES[m.id] || m.name || m.id,
+    provider: 'openrouter' as const,
+    visionSupport: getVisionSupportForModelId(m.id),
+  }));
+}
+
+async function fetchLlamaCppModels(baseUrl: string): Promise<ModelInfo[]> {
+  const url = baseUrl.replace(/\/$/, '') + '/v1/models';
+  const resp = await fetch(url);
+
+  if (!resp.ok) {
+    throw new Error(`llama.cpp server error (${resp.status})`);
+  }
+
+  const data: OpenAiModelsResponse = await resp.json();
+
+  return data.data.map((m) => ({
+    id: `llamacpp:${m.id}`,
+    display_name: m.id,
+    provider: 'llamacpp' as const,
+    visionSupport: 'none' as const,
+  }));
 }
 
 function sortModels(models: ModelInfo[]): ModelInfo[] {
@@ -256,6 +304,32 @@ export function useModels(availableProviders: string[]): UseModelsReturn {
             );
           }
         }
+        if (providers.includes('openrouter')) {
+          const key = getApiKey('openrouter');
+          if (key) {
+            fetches.push(
+              fetchOpenRouterModels(key)
+                .then((models) => ({ models, error: null }))
+                .catch((error) => ({
+                  models: [],
+                  error: error instanceof Error ? error.message : String(error),
+                }))
+            );
+          }
+        }
+        if (providers.includes('llamacpp')) {
+          const baseUrl = getApiKey('llamacpp');
+          if (baseUrl) {
+            fetches.push(
+              fetchLlamaCppModels(baseUrl)
+                .then((models) => ({ models, error: null }))
+                .catch((error) => ({
+                  models: [],
+                  error: error instanceof Error ? error.message : String(error),
+                }))
+            );
+          }
+        }
 
         const results = await Promise.all(fetches);
         const allModels = results.flatMap((result) => result.models);
@@ -306,6 +380,8 @@ export function useModels(availableProviders: string[]): UseModelsReturn {
     (): GroupedModels => ({
       anthropic: models.filter((m) => m.provider === 'anthropic'),
       openai: models.filter((m) => m.provider === 'openai'),
+      openrouter: models.filter((m) => m.provider === 'openrouter'),
+      llamacpp: models.filter((m) => m.provider === 'llamacpp'),
     }),
     [models]
   );

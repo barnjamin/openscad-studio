@@ -148,6 +148,22 @@ export function createModel(provider: AiProvider, apiKey: string, modelId: strin
     });
     return anthropic(modelId);
   }
+  if (provider === 'openrouter') {
+    const openrouter = createOpenAI({
+      apiKey,
+      baseURL: 'https://openrouter.ai/api/v1',
+      compatibility: 'compatible',
+    });
+    return openrouter.chat(modelId);
+  }
+  if (provider === 'llamacpp') {
+    // apiKey holds the base URL (e.g. "http://localhost:8080")
+    const baseURL = apiKey.replace(/\/$/, '') + '/v1';
+    const llamacpp = createOpenAI({ apiKey: 'no-key', baseURL, compatibility: 'compatible' });
+    // Strip the "llamacpp:" prefix before sending to the local server
+    const rawModelId = modelId.startsWith('llamacpp:') ? modelId.slice('llamacpp:'.length) : modelId;
+    return llamacpp.chat(rawModelId);
+  }
   const openai = createOpenAI({ apiKey });
   return openai(modelId);
 }

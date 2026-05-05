@@ -6,6 +6,7 @@ import {
   clearApiKey as clearApiKeyFromStorage,
   hasApiKeyForProvider,
   getAvailableProviders as getAvailableProvidersFromStore,
+  type AiProvider,
 } from '../../stores/apiKeyStore';
 import { useSettings } from '../../stores/settingsStore';
 import { getPlatform } from '../../platform';
@@ -15,6 +16,19 @@ import { ApiProviderCard } from './ApiProviderCard';
 import { ExternalAgentsCard } from './ExternalAgentsCard';
 
 const MASKED_KEY = '••••••••••••••••••••••••••••••••••••••••••••';
+
+function providerLabel(p: AiProvider): string {
+  switch (p) {
+    case 'anthropic':
+      return 'Anthropic';
+    case 'openai':
+      return 'OpenAI';
+    case 'openrouter':
+      return 'OpenRouter';
+    case 'llamacpp':
+      return 'llama.cpp';
+  }
+}
 
 export interface AiSettingsHandle {
   save: () => void;
@@ -29,10 +43,12 @@ interface AiSettingsProps {
 
 export const AiSettings = forwardRef<AiSettingsHandle, AiSettingsProps>(
   ({ isOpen, onCanSaveChange }, ref) => {
-    const [provider, setProvider] = useState<'anthropic' | 'openai'>('anthropic');
+    const [provider, setProvider] = useState<AiProvider>('anthropic');
     const [apiKey, setApiKey] = useState('');
     const [hasAnthropicKey, setHasAnthropicKey] = useState(false);
     const [hasOpenAIKey, setHasOpenAIKey] = useState(false);
+    const [hasOpenRouterKey, setHasOpenRouterKey] = useState(false);
+    const [hasLlamaCppUrl, setHasLlamaCppUrl] = useState(false);
     const [isLoading] = useState(false);
     const [error, setError] = useState<string | null>(null);
     const [showKey, setShowKey] = useState(false);
@@ -43,6 +59,8 @@ export const AiSettings = forwardRef<AiSettingsHandle, AiSettingsProps>(
       const availableProviders = getAvailableProvidersFromStore();
       setHasAnthropicKey(availableProviders.includes('anthropic'));
       setHasOpenAIKey(availableProviders.includes('openai'));
+      setHasOpenRouterKey(availableProviders.includes('openrouter'));
+      setHasLlamaCppUrl(availableProviders.includes('llamacpp'));
 
       if (hasApiKeyForProvider(provider)) {
         setApiKey(MASKED_KEY);
@@ -72,15 +90,14 @@ export const AiSettings = forwardRef<AiSettingsHandle, AiSettingsProps>(
       try {
         storeApiKeyToStorage(provider, apiKey);
         analytics.track('api key saved', { provider });
-        notifySuccess(`${provider === 'anthropic' ? 'Anthropic' : 'OpenAI'} API key saved`, {
+        notifySuccess(`${providerLabel(provider)} key saved`, {
           toastId: `save-api-key-${provider}`,
         });
 
-        if (provider === 'anthropic') {
-          setHasAnthropicKey(true);
-        } else {
-          setHasOpenAIKey(true);
-        }
+        if (provider === 'anthropic') setHasAnthropicKey(true);
+        else if (provider === 'openai') setHasOpenAIKey(true);
+        else if (provider === 'openrouter') setHasOpenRouterKey(true);
+        else if (provider === 'llamacpp') setHasLlamaCppUrl(true);
 
         setApiKey(MASKED_KEY);
         setShowKey(false);
@@ -97,10 +114,11 @@ export const AiSettings = forwardRef<AiSettingsHandle, AiSettingsProps>(
 
     useImperativeHandle(ref, () => ({ save: handleSave }), [handleSave]);
 
-    const handleClear = async (targetProvider: 'anthropic' | 'openai') => {
+    const handleClear = async (targetProvider: AiProvider) => {
+      const label = providerLabel(targetProvider);
       const confirmed = await getPlatform().confirm(
-        `Are you sure you want to remove your ${targetProvider === 'anthropic' ? 'Anthropic' : 'OpenAI'} API key?`,
-        { title: 'Remove API Key', kind: 'warning', okLabel: 'Remove', cancelLabel: 'Cancel' }
+        `Are you sure you want to remove your ${label} ${targetProvider === 'llamacpp' ? 'server URL' : 'API key'}?`,
+        { title: `Remove ${label} Key`, kind: 'warning', okLabel: 'Remove', cancelLabel: 'Cancel' }
       );
       if (!confirmed) return;
 
@@ -109,13 +127,15 @@ export const AiSettings = forwardRef<AiSettingsHandle, AiSettingsProps>(
       try {
         clearApiKeyFromStorage(targetProvider);
         analytics.track('api key cleared', { provider: targetProvider });
-        notifySuccess('API key cleared', { toastId: `clear-api-key-${targetProvider}` });
+        notifySuccess(
+          `${label} ${targetProvider === 'llamacpp' ? 'server URL' : 'API key'} cleared`,
+          { toastId: `clear-api-key-${targetProvider}` }
+        );
 
-        if (targetProvider === 'anthropic') {
-          setHasAnthropicKey(false);
-        } else {
-          setHasOpenAIKey(false);
-        }
+        if (targetProvider === 'anthropic') setHasAnthropicKey(false);
+        else if (targetProvider === 'openai') setHasOpenAIKey(false);
+        else if (targetProvider === 'openrouter') setHasOpenRouterKey(false);
+        else if (targetProvider === 'llamacpp') setHasLlamaCppUrl(false);
 
         if (provider === targetProvider) {
           setApiKey('');
@@ -128,6 +148,14 @@ export const AiSettings = forwardRef<AiSettingsHandle, AiSettingsProps>(
           toastId: `clear-api-key-error-${targetProvider}`,
           logLabel: '[AiSettings] Failed to clear API key',
         });
+      }
+    };
+
+    const activateProvider = (p: AiProvider) => {
+      if (provider !== p) {
+        setProvider(p);
+        setApiKey('');
+        setShowKey(false);
       }
     };
 
@@ -152,29 +180,18 @@ export const AiSettings = forwardRef<AiSettingsHandle, AiSettingsProps>(
           apiKey={apiKey}
           showKey={showKey}
           isLoading={isLoading}
-          onFocus={() => {
-            if (provider !== 'anthropic') {
-              setProvider('anthropic');
-              setApiKey('');
-              setShowKey(false);
-            } else {
-              setProvider('anthropic');
-            }
-          }}
+          onFocus={() => activateProvider('anthropic')}
           onChange={(value) => {
             setProvider('anthropic');
             setApiKey(value);
           }}
           onToggleShow={() => setShowKey((prev) => !prev)}
-          onClear={() => {
-            setProvider('anthropic');
-            handleClear('anthropic');
-          }}
+          onClear={() => handleClear('anthropic')}
         />
 
         <ApiProviderCard
           title="OpenAI API Key"
-          description="Required for OpenAI models."
+          description="Required for OpenAI models (GPT, o-series)."
           placeholder="sk-..."
           keyLink={{ label: 'Get one from OpenAI', href: 'https://platform.openai.com/api-keys' }}
           isActive={provider === 'openai'}
@@ -182,24 +199,52 @@ export const AiSettings = forwardRef<AiSettingsHandle, AiSettingsProps>(
           apiKey={apiKey}
           showKey={showKey}
           isLoading={isLoading}
-          onFocus={() => {
-            if (provider !== 'openai') {
-              setProvider('openai');
-              setApiKey('');
-              setShowKey(false);
-            } else {
-              setProvider('openai');
-            }
-          }}
+          onFocus={() => activateProvider('openai')}
           onChange={(value) => {
             setProvider('openai');
             setApiKey(value);
           }}
           onToggleShow={() => setShowKey((prev) => !prev)}
-          onClear={() => {
-            setProvider('openai');
-            handleClear('openai');
+          onClear={() => handleClear('openai')}
+        />
+
+        <ApiProviderCard
+          title="OpenRouter API Key"
+          description="Access 200+ models from Anthropic, Google, Meta, Mistral, and more through a single key."
+          placeholder="sk-or-..."
+          keyLink={{ label: 'Get one from OpenRouter', href: 'https://openrouter.ai/keys' }}
+          isActive={provider === 'openrouter'}
+          hasKey={hasOpenRouterKey}
+          apiKey={apiKey}
+          showKey={showKey}
+          isLoading={isLoading}
+          onFocus={() => activateProvider('openrouter')}
+          onChange={(value) => {
+            setProvider('openrouter');
+            setApiKey(value);
           }}
+          onToggleShow={() => setShowKey((prev) => !prev)}
+          onClear={() => handleClear('openrouter')}
+        />
+
+        <ApiProviderCard
+          title="llama.cpp Server URL"
+          description="Connect to a local llama.cpp server running an OpenAI-compatible endpoint."
+          placeholder="http://localhost:8080"
+          keyLink={{ label: 'llama.cpp on GitHub', href: 'https://github.com/ggml-org/llama.cpp' }}
+          isActive={provider === 'llamacpp'}
+          hasKey={hasLlamaCppUrl}
+          apiKey={apiKey}
+          showKey={showKey}
+          isLoading={isLoading}
+          isSecret={false}
+          onFocus={() => activateProvider('llamacpp')}
+          onChange={(value) => {
+            setProvider('llamacpp');
+            setApiKey(value);
+          }}
+          onToggleShow={() => setShowKey((prev) => !prev)}
+          onClear={() => handleClear('llamacpp')}
         />
 
         {error && (
@@ -225,3 +270,4 @@ export const AiSettings = forwardRef<AiSettingsHandle, AiSettingsProps>(
 );
 
 AiSettings.displayName = 'AiSettings';
+

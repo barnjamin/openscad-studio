@@ -30,8 +30,8 @@ export function ModelSelector({
   const { groupedByProvider, isLoading, error, fromCache, refreshModels } =
     useModels(availableProviders);
 
-  const { anthropic: anthropicModels, openai: openaiModels } = groupedByProvider;
-  const hasModels = anthropicModels.length > 0 || openaiModels.length > 0;
+  const { anthropic: anthropicModels, openai: openaiModels, openrouter: openrouterModels, llamacpp: llamacppModels } = groupedByProvider;
+  const hasModels = anthropicModels.length > 0 || openaiModels.length > 0 || openrouterModels.length > 0 || llamacppModels.length > 0;
 
   useEffect(() => {
     if (!error) return;
@@ -89,6 +89,32 @@ export function ModelSelector({
             <SelectGroup>
               <SelectLabel>OpenAI</SelectLabel>
               {openaiModels.map((model) => (
+                <SelectItem key={model.id} value={model.id}>
+                  {model.display_name}
+                </SelectItem>
+              ))}
+            </SelectGroup>
+          )}
+          {(anthropicModels.length > 0 || openaiModels.length > 0) && openrouterModels.length > 0 && (
+            <div className="my-1 mx-2 h-px" style={{ backgroundColor: 'var(--border-primary)' }} />
+          )}
+          {openrouterModels.length > 0 && (
+            <SelectGroup>
+              <SelectLabel>OpenRouter</SelectLabel>
+              {openrouterModels.map((model) => (
+                <SelectItem key={model.id} value={model.id}>
+                  {model.display_name}
+                </SelectItem>
+              ))}
+            </SelectGroup>
+          )}
+          {(anthropicModels.length > 0 || openaiModels.length > 0 || openrouterModels.length > 0) && llamacppModels.length > 0 && (
+            <div className="my-1 mx-2 h-px" style={{ backgroundColor: 'var(--border-primary)' }} />
+          )}
+          {llamacppModels.length > 0 && (
+            <SelectGroup>
+              <SelectLabel>llama.cpp (local)</SelectLabel>
+              {llamacppModels.map((model) => (
                 <SelectItem key={model.id} value={model.id}>
                   {model.display_name}
                 </SelectItem>

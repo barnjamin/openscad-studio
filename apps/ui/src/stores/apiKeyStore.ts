@@ -8,10 +8,12 @@ import { getPreferredDefaultModel } from '../utils/aiModels';
 const STORAGE_KEYS = {
   anthropic: 'openscad_studio_anthropic_api_key',
   openai: 'openscad_studio_openai_api_key',
+  openrouter: 'openscad_studio_openrouter_api_key',
+  llamacpp: 'openscad_studio_llamacpp_base_url',
   model: 'openscad_studio_ai_model',
 } as const;
 
-export type AiProvider = 'anthropic' | 'openai';
+export type AiProvider = 'anthropic' | 'openai' | 'openrouter' | 'llamacpp';
 
 interface ApiKeySnapshot {
   availableProviders: AiProvider[];
@@ -68,7 +70,14 @@ export function getAvailableProviders(): AiProvider[] {
   const providers: AiProvider[] = [];
   if (hasApiKeyForProvider('anthropic')) providers.push('anthropic');
   if (hasApiKeyForProvider('openai')) providers.push('openai');
+  if (hasApiKeyForProvider('openrouter')) providers.push('openrouter');
+  if (hasApiKeyForProvider('llamacpp')) providers.push('llamacpp');
   return providers;
+}
+
+/** Returns the configured llama.cpp base URL, or null if not set. */
+export function getLlamaCppBaseUrl(): string | null {
+  return getApiKey('llamacpp');
 }
 
 // ============================================================================
@@ -88,6 +97,9 @@ export function setStoredModel(model: string): void {
 // ============================================================================
 
 export function getProviderFromModel(modelId: string): AiProvider {
+  if (modelId.startsWith('llamacpp:')) {
+    return 'llamacpp';
+  }
   if (modelId.startsWith('claude') || modelId.startsWith('anthropic')) {
     return 'anthropic';
   }
@@ -98,6 +110,10 @@ export function getProviderFromModel(modelId: string): AiProvider {
     modelId.startsWith('chatgpt')
   ) {
     return 'openai';
+  }
+  // OpenRouter model IDs use provider/model format (e.g. "anthropic/claude-3-5-sonnet")
+  if (modelId.includes('/')) {
+    return 'openrouter';
   }
   return 'anthropic'; // Default
 }

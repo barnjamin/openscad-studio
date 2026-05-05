@@ -26,6 +26,8 @@ export interface ApiProviderCardProps {
   apiKey: string;
   showKey: boolean;
   isLoading: boolean;
+  /** When false, always renders as a plain text input (e.g. for URLs). Defaults to true. */
+  isSecret?: boolean;
   onFocus: () => void;
   onChange: (value: string) => void;
   onToggleShow: () => void;
@@ -42,6 +44,7 @@ export function ApiProviderCard({
   apiKey,
   showKey,
   isLoading,
+  isSecret = true,
   onFocus,
   onChange,
   onToggleShow,
@@ -53,8 +56,8 @@ export function ApiProviderCard({
   };
 
   const displayValue = isActive ? apiKey : '';
-  const inputType = showKey && isActive ? 'text' : 'password';
-  const showToggleVisible = isActive && apiKey && !apiKey.startsWith('•');
+  const inputType = !isSecret || (showKey && isActive) ? 'text' : 'password';
+  const showToggleVisible = isSecret && isActive && apiKey && !apiKey.startsWith('•');
 
   return (
     <SettingsCard className="ph-no-capture">
